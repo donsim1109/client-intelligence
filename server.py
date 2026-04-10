@@ -502,6 +502,22 @@ def scrape_endpoint():
         logs.append(f"Error: {e}")
         return jsonify(error=str(e), logs=logs), 500
 
+# ---- global error handlers ---------------------------------------------------
+
+@app.errorhandler(404)
+def not_found(e):
+    if request.path.startswith("/api/"):
+        return jsonify(error="Not found"), 404
+    return INDEX_HTML, 200, {"Content-Type": "text/html; charset=utf-8"}
+
+@app.errorhandler(405)
+def method_not_allowed(e):
+    return jsonify(error="Method not allowed"), 405
+
+@app.errorhandler(500)
+def internal_error(e):
+    return jsonify(error="Internal server error: " + str(e)), 500
+
 # ---- frontend -----------------------------------------------------------------
 
 INDEX_HTML = """
@@ -896,6 +912,11 @@ async function api(method, path, body) {
   const opts = { method, credentials: "include", headers: { "Content-Type": "application/json" } };
   if (body) opts.body = JSON.stringify(body);
   const r = await fetch(path, opts);
+  const ct = r.headers.get("content-type") || "";
+  if (!ct.includes("application/json")) {
+    const text = await r.text();
+    throw new Error("Server error (" + r.status + "): " + text.slice(0, 120));
+  }
   const data = await r.json();
   if (!r.ok) throw new Error(data.error || "Request failed");
   return data;
@@ -1328,6 +1349,8 @@ init();
 @app.route("/")
 @app.route("/<path:path>")
 def frontend(path=""):
+    if path and path.startswith("api/"):
+        return jsonify(error="Not found"), 404
     return INDEX_HTML, 200, {"Content-Type": "text/html; charset=utf-8"}
 
 # ---- run ----------------------------------------------------------------------
