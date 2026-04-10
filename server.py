@@ -775,7 +775,7 @@ INDEX_HTML = """
 
     <!-- Scrape bar (shown on all tabs) -->
     <div class="scrape-bar">
-      <input type="url" id="scrapeInput" placeholder="Paste URL — e.g. https://www.flowout.com/portfolio or imagine.si" onkeydown="if(event.key==='Enter')doScrape()">
+      <input type="text" id="scrapeInput" placeholder="Paste URL — e.g. https://www.flowout.com/portfolio or imagine.si" onkeydown="if(event.key==='Enter')doScrape()">
       <button class="btn btn-default" id="scrapeBtn" onclick="doScrape()">Scrape</button>
     </div>
     <div class="scrape-hint">
