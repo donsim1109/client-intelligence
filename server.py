@@ -4,6 +4,8 @@ import time
 import hashlib
 import secrets
 import os
+import sqlite3
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from urllib.parse import urljoin, urlparse
 
@@ -14,38 +16,168 @@ from bs4 import BeautifulSoup
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "data")
-TEMPLATES_DIR = os.path.join(BASE_DIR, "templates")
 os.makedirs(DATA_DIR, exist_ok=True)
 
-app = Flask(__name__, template_folder=TEMPLATES_DIR)
+app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", secrets.token_hex(32))
 app.permanent_session_lifetime = timedelta(days=30)
 app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 app.config["SESSION_COOKIE_SECURE"] = False
 CORS(app, supports_credentials=True)
 
-# ---- storage ------------------------------------------------------------------
+# ---- database -----------------------------------------------------------------
+# Uses PostgreSQL when DATABASE_URL env var is set (Railway/Render/Heroku),
+# otherwise falls back to SQLite (local dev, or Railway without a DB addon).
 
-def users_file():
-    return os.path.join(DATA_DIR, "users.json")
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
-def repo_file(email):
-    h = hashlib.md5(email.encode()).hexdigest()
-    return os.path.join(DATA_DIR, f"repo_{h}.json")
+# Railway sets DATABASE_URL as postgres:// but psycopg2 needs postgresql://
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
-def load_json(path, default):
-    try:
-        with open(path, encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return default
+USE_POSTGRES = bool(DATABASE_URL)
 
-def save_json(path, data):
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+if USE_POSTGRES:
+    import psycopg2
+    import psycopg2.extras
+    print("[DB] Using PostgreSQL:", DATABASE_URL[:40] + "...")
+else:
+    SQLITE_PATH = os.path.join(DATA_DIR, "app.db")
+    print("[DB] Using SQLite:", SQLITE_PATH)
+
+@contextmanager
+def get_db():
+    if USE_POSTGRES:
+        conn = psycopg2.connect(DATABASE_URL)
+        conn.autocommit = False
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+    else:
+        conn = sqlite3.connect(SQLITE_PATH)
+        conn.row_factory = sqlite3.Row
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+def init_db():
+    """Create tables if they don't exist."""
+    with get_db() as conn:
+        cur = conn.cursor()
+        if USE_POSTGRES:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    email TEXT PRIMARY KEY,
+                    password_hash TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT NOW()
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS repos (
+                    email TEXT NOT NULL,
+                    company_key TEXT NOT NULL,
+                    data JSONB NOT NULL,
+                    updated_at TIMESTAMP DEFAULT NOW(),
+                    PRIMARY KEY (email, company_key)
+                )
+            """)
+        else:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    email TEXT PRIMARY KEY,
+                    password_hash TEXT NOT NULL,
+                    created_at TEXT DEFAULT (datetime('now'))
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS repos (
+                    email TEXT NOT NULL,
+                    company_key TEXT NOT NULL,
+                    data TEXT NOT NULL,
+                    updated_at TEXT DEFAULT (datetime('now')),
+                    PRIMARY KEY (email, company_key)
+                )
+            """)
+
+# Run migrations on startup
+init_db()
 
 def hash_pw(pw):
     return hashlib.sha256(pw.encode()).hexdigest()
+
+# ---- user helpers -------------------------------------------------------------
+
+def db_get_user(email):
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT email, password_hash FROM users WHERE email = %s" if USE_POSTGRES else
+                    "SELECT email, password_hash FROM users WHERE email = ?", (email,))
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+def db_create_user(email, password):
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO users (email, password_hash) VALUES (%s, %s)" if USE_POSTGRES else
+            "INSERT INTO users (email, password_hash) VALUES (?, ?)",
+            (email, hash_pw(password))
+        )
+
+def db_get_repo(email):
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT company_key, data FROM repos WHERE email = %s" if USE_POSTGRES else
+            "SELECT company_key, data FROM repos WHERE email = ?",
+            (email,)
+        )
+        rows = cur.fetchall()
+        result = {}
+        for row in rows:
+            key = row[0] if USE_POSTGRES else row["company_key"]
+            raw = row[1] if USE_POSTGRES else row["data"]
+            data = raw if isinstance(raw, dict) else json.loads(raw)
+            result[key] = data
+        return result
+
+def db_save_entry(email, key, data):
+    with get_db() as conn:
+        cur = conn.cursor()
+        payload = json.dumps(data, ensure_ascii=False) if not USE_POSTGRES else json.dumps(data)
+        if USE_POSTGRES:
+            cur.execute("""
+                INSERT INTO repos (email, company_key, data, updated_at)
+                VALUES (%s, %s, %s::jsonb, NOW())
+                ON CONFLICT (email, company_key) DO UPDATE
+                SET data = EXCLUDED.data, updated_at = NOW()
+            """, (email, key, payload))
+        else:
+            cur.execute("""
+                INSERT INTO repos (email, company_key, data, updated_at)
+                VALUES (?, ?, ?, datetime('now'))
+                ON CONFLICT (email, company_key) DO UPDATE
+                SET data = excluded.data, updated_at = datetime('now')
+            """, (email, key, payload))
+
+def db_delete_entry(email, key):
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "DELETE FROM repos WHERE email = %s AND company_key = %s" if USE_POSTGRES else
+            "DELETE FROM repos WHERE email = ? AND company_key = ?",
+            (email, key)
+        )
 
 # ---- auth routes --------------------------------------------------------------
 
@@ -58,11 +190,12 @@ def signup():
         return jsonify(error="Email and password required"), 400
     if len(pw) < 8:
         return jsonify(error="Password must be at least 8 characters"), 400
-    users = load_json(users_file(), {})
-    if email in users:
+    if db_get_user(email):
         return jsonify(error="An account with this email already exists"), 400
-    users[email] = {"email": email, "ph": hash_pw(pw), "created": datetime.now().isoformat()}
-    save_json(users_file(), users)
+    try:
+        db_create_user(email, pw)
+    except Exception as e:
+        return jsonify(error="Could not create account: " + str(e)), 500
     session.permanent = True
     session["email"] = email
     return jsonify(ok=True, email=email)
@@ -72,11 +205,10 @@ def login():
     d = request.json or {}
     email = (d.get("email") or "").strip().lower()
     pw = d.get("password") or ""
-    users = load_json(users_file(), {})
-    user = users.get(email)
+    user = db_get_user(email)
     if not user:
         return jsonify(error="No account found with this email"), 401
-    if user["ph"] != hash_pw(pw):
+    if user["password_hash"] != hash_pw(pw):
         return jsonify(error="Incorrect password"), 401
     session.permanent = True
     session["email"] = email
@@ -101,16 +233,14 @@ def get_repo():
     email = session.get("email")
     if not email:
         return jsonify(error="Not logged in"), 401
-    return jsonify(load_json(repo_file(email), {}))
+    return jsonify(db_get_repo(email))
 
 @app.route("/api/repo/<key>", methods=["DELETE"])
 def delete_entry(key):
     email = session.get("email")
     if not email:
         return jsonify(error="Not logged in"), 401
-    repo = load_json(repo_file(email), {})
-    repo.pop(key, None)
-    save_json(repo_file(email), repo)
+    db_delete_entry(email, key)
     return jsonify(ok=True)
 
 # ---- scraper ------------------------------------------------------------------
@@ -494,9 +624,7 @@ def scrape_endpoint():
     logs = []
     try:
         result = run_scrape(url, logs)
-        repo = load_json(repo_file(email), {})
-        repo[result["key"]] = result
-        save_json(repo_file(email), repo)
+        db_save_entry(email, result["key"], result)
         return jsonify(result=result, logs=logs)
     except Exception as e:
         logs.append(f"Error: {e}")
