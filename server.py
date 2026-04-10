@@ -91,6 +91,14 @@ def init_db():
                     PRIMARY KEY (email, company_key)
                 )
             """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS settings (
+                    email TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    value TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY (email, name)
+                )
+            """)
         else:
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS users (
@@ -106,6 +114,14 @@ def init_db():
                     data TEXT NOT NULL,
                     updated_at TEXT DEFAULT (datetime('now')),
                     PRIMARY KEY (email, company_key)
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS settings (
+                    email TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    value TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY (email, name)
                 )
             """)
 
@@ -528,7 +544,7 @@ def scrape_one(url, logs):
     logs.append(f"  -> tables:{t} case-links:{cs} headings:{h} sections:{sec} logos:{lg}")
     return results, soup, final
 
-def run_scrape(input_url, logs):
+def run_scrape(input_url, logs, user_api_key=None):
     url = input_url.strip()
     if not re.match(r"^https?://", url): url = "https://" + url
     parsed = urlparse(url)
@@ -582,8 +598,9 @@ def run_scrape(input_url, logs):
             logs.append(f"  Failed {cu}: {e}")
 
     deduped = dedupe(all_clients)
-    logs.append(f"Done: {len(deduped)} unique clients from {len(scraped)} page(s)")
+    logs.append(f"Done: {len(deduped)} raw candidates from {len(scraped)} page(s)")
 
+    # Get company name first so AI has context
     comp_name, comp_desc = "", ""
     if home_soup:
         og_title = home_soup.find("meta", property="og:title")
@@ -597,6 +614,10 @@ def run_scrape(input_url, logs):
     if not comp_name:
         comp_name = domain.split(".")[0].replace("-"," ").title()
 
+    # AI validation + cleaning pass
+    deduped = ai_clean_clients(deduped, comp_name, domain, logs, extra_key=user_api_key)
+    logs.append(f"Final: {len(deduped)} validated clients")
+
     key = re.sub(r"[^a-z0-9.-]", "", domain)
     return {
         "key": key,
@@ -608,7 +629,160 @@ def run_scrape(input_url, logs):
         "clients": deduped,
         "sources_checked": scraped,
         "scraped_at": datetime.now().isoformat(),
+        "ai_cleaned": bool(os.environ.get("ANTHROPIC_API_KEY")),
     }
+
+
+
+def db_get_setting(email, name):
+    try:
+        with get_db() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT value FROM settings WHERE email = %s AND name = %s" if USE_POSTGRES else
+                "SELECT value FROM settings WHERE email = ? AND name = ?",
+                (email, name)
+            )
+            row = cur.fetchone()
+            return (row[0] if USE_POSTGRES else row["value"]) if row else None
+    except Exception:
+        return None
+
+def db_save_setting(email, name, value):
+    with get_db() as conn:
+        cur = conn.cursor()
+        if USE_POSTGRES:
+            cur.execute("""
+                INSERT INTO settings (email, name, value)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (email, name) DO UPDATE SET value = EXCLUDED.value
+            """, (email, name, value))
+        else:
+            cur.execute("""
+                INSERT INTO settings (email, name, value)
+                VALUES (?, ?, ?)
+                ON CONFLICT (email, name) DO UPDATE SET value = excluded.value
+            """, (email, name, value))
+
+# ---- AI cleaning layer --------------------------------------------------------
+# Called after raw scraping. Uses Claude to validate, clean and enrich clients.
+
+ANTHROPIC_API = "https://api.anthropic.com/v1/messages"
+
+def ai_clean_clients(raw_clients, company_name, company_domain, logs, extra_key=None):
+    """
+    Send raw scraped candidates to Claude.
+    Returns cleaned, validated, enriched list.
+    Falls back to raw list if API key missing or call fails.
+    """
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "") or (extra_key or "")
+    if not api_key:
+        logs.append("AI cleaning skipped - add your Anthropic API key in Settings to enable")
+        return raw_clients
+
+    if not raw_clients:
+        return raw_clients
+
+    logs.append(f"AI cleaning: validating {len(raw_clients)} candidates...")
+
+    # Build compact candidate list for the prompt
+    candidates = []
+    for i, c in enumerate(raw_clients):
+        entry = {"i": i, "name": c.get("name",""), "source": c.get("source","")}
+        if c.get("industry"): entry["industry"] = c["industry"]
+        candidates.append(entry)
+
+    prompt = f"""You are a data cleaning specialist for a client intelligence database.
+
+The company being analysed is: "{company_name}" ({company_domain})
+
+Below is a raw list of candidate client names scraped from their website.
+Your job is to clean and validate each one.
+
+RAW CANDIDATES:
+{json.dumps(candidates, ensure_ascii=False)}
+
+For each candidate decide:
+1. KEEP - it is a real client/customer/partner company name
+2. REMOVE - it is noise: a page headline, navigation item, generic word, service tag,
+   technology name, decorative text, or clearly not a company
+
+Also:
+- If a name is a case study TITLE (e.g. "How Acme grew 3x") extract just the company name ("Acme")
+- If a name has legal suffixes that are inconsistent (e.g. "NLB" and "NLB d.d.") keep the fuller version
+- Normalise capitalisation (e.g. "acme corp" -> "Acme Corp")
+- If you can infer the industry from context, add it
+- Give each kept entry a confidence score 0-100
+
+Return ONLY valid JSON, no markdown, no explanation:
+{{
+  "cleaned": [
+    {{
+      "i": <original index>,
+      "name": "Cleaned Company Name",
+      "industry": "industry or empty string",
+      "confidence": 95,
+      "note": "optional short note e.g. extracted from case study title"
+    }}
+  ],
+  "removed": [<list of original indexes that were noise>],
+  "summary": "one sentence summary of what was found and removed"
+}}"""
+
+    try:
+        resp = requests.post(
+            ANTHROPIC_API,
+            headers={
+                "x-api-key": api_key,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": "claude-haiku-4-5-20251001",
+                "max_tokens": 4096,
+                "messages": [{"role": "user", "content": prompt}],
+            },
+            timeout=60,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        text = "".join(b.get("text","") for b in data.get("content",[]) if b.get("type")=="text")
+        text = re.sub(r"```json|```", "", text).strip()
+        m = re.search(r"\{[\s\S]*\}", text)
+        if not m:
+            raise ValueError("No JSON in AI response")
+        result = json.loads(m.group())
+
+        removed_set = set(result.get("removed", []))
+        cleaned_map = {c["i"]: c for c in result.get("cleaned", [])}
+        summary = result.get("summary", "")
+
+        out = []
+        for orig_idx, orig in enumerate(raw_clients):
+            if orig_idx in removed_set:
+                continue
+            cleaned = cleaned_map.get(orig_idx)
+            if cleaned:
+                entry = dict(orig)
+                entry["name"] = cleaned.get("name", orig.get("name",""))
+                if cleaned.get("industry"):
+                    entry["industry"] = cleaned["industry"]
+                entry["confidence"] = cleaned.get("confidence", 80)
+                if cleaned.get("note"):
+                    entry["ai_note"] = cleaned["note"]
+                out.append(entry)
+            else:
+                out.append(dict(orig))
+        kept = len(out)
+        removed = len(raw_clients) - kept
+        logs.append(f"AI cleaning: kept {kept}, removed {removed} noise entries")
+        if summary:
+            logs.append(f"AI summary: {summary}")
+        return out
+
+    except Exception as e:
+        logs.append(f"AI cleaning failed ({e}), using raw data")
+        return raw_clients
 
 # ---- scrape API ---------------------------------------------------------------
 
@@ -623,12 +797,41 @@ def scrape_endpoint():
         return jsonify(error="URL required"), 400
     logs = []
     try:
-        result = run_scrape(url, logs)
+        user_api_key = db_get_setting(email, "anthropic_key") or ""
+        result = run_scrape(url, logs, user_api_key=user_api_key)
         db_save_entry(email, result["key"], result)
         return jsonify(result=result, logs=logs)
     except Exception as e:
         logs.append(f"Error: {e}")
         return jsonify(error=str(e), logs=logs), 500
+
+
+# ---- settings routes ----------------------------------------------------------
+
+@app.route("/api/settings", methods=["GET"])
+def get_settings():
+    email = session.get("email")
+    if not email:
+        return jsonify(error="Not logged in"), 401
+    has_env_key = bool(os.environ.get("ANTHROPIC_API_KEY", ""))
+    user_key = db_get_setting(email, "anthropic_key") or ""
+    return jsonify(
+        ai_enabled=has_env_key or bool(user_key),
+        has_env_key=has_env_key,
+        has_user_key=bool(user_key),
+    )
+
+@app.route("/api/settings/apikey", methods=["POST"])
+def save_apikey():
+    email = session.get("email")
+    if not email:
+        return jsonify(error="Not logged in"), 401
+    d = request.json or {}
+    key = (d.get("key") or "").strip()
+    if key and not key.startswith("sk-ant-"):
+        return jsonify(error="Key should start with sk-ant-"), 400
+    db_save_setting(email, "anthropic_key", key)
+    return jsonify(ok=True, ai_enabled=bool(key))
 
 # ---- global error handlers ---------------------------------------------------
 
@@ -904,6 +1107,10 @@ td{padding:13px 12px;font-size:13px;vertical-align:middle}
     <div class="topbar-divider"></div>
     <span style="font-size:11px;color:var(--text3);font-family:var(--mono)">competitor client discovery</span>
     <div class="topbar-right">
+      <button onclick="toggleSettings()" id="settingsBtn" style="background:var(--bg3);border:1px solid var(--border);border-radius:7px;padding:5px 10px;cursor:pointer;font-size:11px;color:var(--text2);font-family:var(--mono);display:flex;align-items:center;gap:6px">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+        <span id="aiStatusDot">AI</span>
+      </button>
       <button class="avatar-btn" onclick="toggleDrop()">
         <span class="avatar" id="avLetter">?</span>
         <span id="avEmail" style="max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:var(--mono)"></span>
@@ -1029,6 +1236,42 @@ td{padding:13px 12px;font-size:13px;vertical-align:middle}
     <div class="scrape-hint">Direct URL works best &mdash; e.g. company.com/clients/ &bull; Zero AI tokens</div>
   </div>
 
+</div>
+
+<!-- Settings modal -->
+<div id="settingsModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:500;align-items:center;justify-content:center">
+  <div style="background:var(--bg2);border:1px solid var(--border2);border-radius:14px;width:460px;padding:28px;max-width:95vw">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:20px">
+      <h2 style="font-size:16px;font-weight:600">Settings</h2>
+      <button onclick="toggleSettings()" style="background:none;border:none;cursor:pointer;color:var(--text2);font-size:20px;line-height:1">&times;</button>
+    </div>
+
+    <div style="margin-bottom:20px;padding:14px;background:var(--bg3);border-radius:9px;border:1px solid var(--border)">
+      <div style="font-size:12px;font-weight:600;color:var(--text1);margin-bottom:6px;display:flex;align-items:center;gap:8px">
+        <span id="aiStatusIcon">&#9679;</span> AI Cleaning
+        <span id="aiStatusLabel" style="font-size:11px;font-weight:400;font-family:var(--mono)"></span>
+      </div>
+      <div style="font-size:12px;color:var(--text2);line-height:1.6">
+        When enabled, Claude validates each scraped entry — removes noise (headlines, nav items, decorative logos),
+        extracts real company names from case study titles, and enriches with industry data.
+      </div>
+    </div>
+
+    <div style="margin-bottom:6px">
+      <label style="display:block;font-size:11px;font-weight:500;color:var(--text2);margin-bottom:6px;text-transform:uppercase;letter-spacing:.6px;font-family:var(--mono)">Anthropic API Key</label>
+      <div style="display:flex;gap:8px">
+        <input type="password" id="apiKeyInput" placeholder="sk-ant-api03-..." style="flex:1;background:var(--bg3);border:1px solid var(--border2);border-radius:7px;padding:9px 12px;font-size:13px;color:var(--text0);font-family:var(--mono);outline:none">
+        <button onclick="saveApiKey()" style="background:var(--accent);color:#000;border:none;border-radius:7px;padding:9px 16px;font-size:13px;font-weight:600;cursor:pointer;white-space:nowrap;font-family:var(--sans)">Save</button>
+      </div>
+      <div id="apiKeyMsg" style="font-size:11px;margin-top:6px;font-family:var(--mono)"></div>
+    </div>
+
+    <div style="font-size:11px;color:var(--text3);margin-top:12px;font-family:var(--mono);line-height:1.7">
+      Get a free key at console.anthropic.com &rarr; API Keys<br>
+      Stored securely in the database, used only for cleaning scraped data.<br>
+      Leave blank to disable AI cleaning (raw scrape results only).
+    </div>
+  </div>
 </div>
 
 <script>
@@ -1388,6 +1631,55 @@ function updateDropStats() {
 
 function esc(s) {
   return (s||'').toString().replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+// ---- settings ---------------------------------------------------------------
+function toggleSettings() {
+  const m = document.getElementById('settingsModal');
+  m.style.display = m.style.display === 'flex' ? 'none' : 'flex';
+  if (m.style.display === 'flex') loadSettings();
+}
+document.getElementById('settingsModal').addEventListener('click', function(e) {
+  if (e.target === this) toggleSettings();
+});
+
+async function loadSettings() {
+  try {
+    const s = await api('GET', '/api/settings');
+    const dot = document.getElementById('aiStatusDot');
+    const label = document.getElementById('aiStatusLabel');
+    const topDot = document.getElementById('aiStatusDot');
+    if (s.ai_enabled) {
+      dot.style.color = 'var(--green)';
+      label.textContent = s.has_env_key ? 'enabled (server key)' : 'enabled (your key)';
+      topDot.textContent = 'AI ON';
+      document.getElementById('settingsBtn').style.borderColor = 'rgba(61,214,140,.4)';
+      document.getElementById('settingsBtn').style.color = 'var(--green)';
+    } else {
+      dot.style.color = 'var(--text3)';
+      label.textContent = 'disabled - add API key to enable';
+      topDot.textContent = 'AI';
+      document.getElementById('settingsBtn').style.borderColor = '';
+      document.getElementById('settingsBtn').style.color = '';
+    }
+    if (s.has_user_key) {
+      document.getElementById('apiKeyInput').placeholder = 'sk-ant-... (saved)';
+    }
+  } catch(e) {}
+}
+
+async function saveApiKey() {
+  const key = document.getElementById('apiKeyInput').value.trim();
+  const msg = document.getElementById('apiKeyMsg');
+  try {
+    const r = await api('POST', '/api/settings/apikey', { key });
+    msg.style.color = 'var(--green)';
+    msg.textContent = r.ai_enabled ? 'AI cleaning enabled.' : 'Key cleared. AI cleaning disabled.';
+    loadSettings();
+  } catch(e) {
+    msg.style.color = 'var(--red)';
+    msg.textContent = e.message;
+  }
 }
 
 init();
