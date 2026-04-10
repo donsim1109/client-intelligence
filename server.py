@@ -19,11 +19,20 @@ DATA_DIR = os.path.join(BASE_DIR, "data")
 os.makedirs(DATA_DIR, exist_ok=True)
 
 app = Flask(__name__)
-app.secret_key = os.environ.get("SECRET_KEY", secrets.token_hex(32))
+# SECRET_KEY must be stable across restarts - generate once and set as env var on Railway
+# If not set, we use a fixed fallback (fine for dev, set it on Railway for production)
+_fallback_key = "change-me-set-SECRET_KEY-env-var-on-railway"
+app.secret_key = os.environ.get("SECRET_KEY", _fallback_key)
 app.permanent_session_lifetime = timedelta(days=30)
-app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
-app.config["SESSION_COOKIE_SECURE"] = False
-CORS(app, supports_credentials=True)
+
+# Detect if running on HTTPS (Railway/production) or HTTP (local dev)
+_is_https = os.environ.get("RAILWAY_ENVIRONMENT") or os.environ.get("RENDER") or os.environ.get("HTTPS") == "true"
+
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SECURE"] = bool(_is_https)
+app.config["SESSION_COOKIE_SAMESITE"] = "None" if _is_https else "Lax"
+
+CORS(app, supports_credentials=True, origins="*")
 
 # ---- database -----------------------------------------------------------------
 # Uses PostgreSQL when DATABASE_URL env var is set (Railway/Render/Heroku),
