@@ -327,19 +327,18 @@ def claude(prompt, api_key, max_tokens=8000, use_search=False):
         "max_tokens": max_tokens,
         "messages": [{"role": "user", "content": prompt}],
     }
+    headers = {
+        "x-api-key": api_key,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+    }
     if use_search:
         body["tools"] = [{"type": "web_search_20250305", "name": "web_search"}]
-    r = requests.post(
-        ANTHROPIC_API,
-        headers={
-            "x-api-key": api_key,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json",
-        },
-        json=body,
-        timeout=180,
-    )
-    r.raise_for_status()
+        headers["anthropic-beta"] = "web-search-2025-03-05"
+    r = requests.post(ANTHROPIC_API, headers=headers, json=body, timeout=180)
+    if not r.ok:
+        err_body = r.text[:300]
+        raise RuntimeError(f"Claude API {r.status_code}: {err_body}")
     data = r.json()
     if "error" in data:
         raise RuntimeError(data["error"].get("message", "Claude API error"))
@@ -421,6 +420,13 @@ Return ONLY valid JSON:
         logs.append(f"  Found {len(pages_to_fetch)} pages to analyse:")
         for p in pages_to_fetch:
             logs.append(f"    [{p.get('type','?')}] {p.get('url','')} — {p.get('description','')}")
+    except RuntimeError as e:
+        err = str(e)
+        logs.append(f"  Discovery failed: {err}")
+        if "400" in err:
+            logs.append("  Hint: web search tool may need anthropic-beta header — check server logs")
+        logs.append("  Falling back: fetching input URL directly")
+        pages_to_fetch = [{"url": url, "type": "homepage", "description": "direct input"}]
     except Exception as e:
         logs.append(f"  Discovery failed: {e}. Falling back to input URL.")
         pages_to_fetch = [{"url": url, "type": "homepage", "description": "direct input"}]
