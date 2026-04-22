@@ -1,58 +1,52 @@
-import re
-import json
-import time
-import hashlib
-import secrets
-import os
-import sqlite3
+"""
+Client Intelligence - Complete server
+Three-phase AI pipeline:
+  1. Web search to discover ALL client/reference pages
+  2. Fetch full HTML of each page
+  3. Claude reads everything and returns structured client database
+"""
+import re, json, time, hashlib, secrets, os, sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from urllib.parse import urljoin, urlparse
 
-from flask import Flask, request, jsonify, send_from_directory, session
+from flask import Flask, request, jsonify, session
 from flask_cors import CORS
 import requests
 from bs4 import BeautifulSoup
 
+# ---------------------------------------------------------------------------
+# App setup
+# ---------------------------------------------------------------------------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "data")
 os.makedirs(DATA_DIR, exist_ok=True)
 
 app = Flask(__name__)
-# SECRET_KEY must be stable across restarts - generate once and set as env var on Railway
-# If not set, we use a fixed fallback (fine for dev, set it on Railway for production)
-_fallback_key = "change-me-set-SECRET_KEY-env-var-on-railway"
-app.secret_key = os.environ.get("SECRET_KEY", _fallback_key)
+app.secret_key = os.environ.get("SECRET_KEY", "dev-secret-change-on-railway")
 app.permanent_session_lifetime = timedelta(days=30)
 
-# Detect if running on HTTPS (Railway/production) or HTTP (local dev)
-_is_https = os.environ.get("RAILWAY_ENVIRONMENT") or os.environ.get("RENDER") or os.environ.get("HTTPS") == "true"
-
-app.config["SESSION_COOKIE_HTTPONLY"] = True
-app.config["SESSION_COOKIE_SECURE"] = bool(_is_https)
+_is_https = bool(os.environ.get("RAILWAY_ENVIRONMENT") or os.environ.get("RENDER"))
+app.config["SESSION_COOKIE_HTTPONLY"]  = True
+app.config["SESSION_COOKIE_SECURE"]   = _is_https
 app.config["SESSION_COOKIE_SAMESITE"] = "None" if _is_https else "Lax"
 
 CORS(app, supports_credentials=True, origins="*")
 
-# ---- database -----------------------------------------------------------------
-# Uses PostgreSQL when DATABASE_URL env var is set (Railway/Render/Heroku),
-# otherwise falls back to SQLite (local dev, or Railway without a DB addon).
-
+# ---------------------------------------------------------------------------
+# Database
+# ---------------------------------------------------------------------------
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
-
-# Railway sets DATABASE_URL as postgres:// but psycopg2 needs postgresql://
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
-
 USE_POSTGRES = bool(DATABASE_URL)
 
 if USE_POSTGRES:
-    import psycopg2
-    import psycopg2.extras
-    print("[DB] Using PostgreSQL:", DATABASE_URL[:40] + "...")
+    import psycopg2, psycopg2.extras
+    print("[DB] PostgreSQL")
 else:
     SQLITE_PATH = os.path.join(DATA_DIR, "app.db")
-    print("[DB] Using SQLite:", SQLITE_PATH)
+    print("[DB] SQLite:", SQLITE_PATH)
 
 @contextmanager
 def get_db():
@@ -60,157 +54,132 @@ def get_db():
         conn = psycopg2.connect(DATABASE_URL)
         conn.autocommit = False
         try:
-            yield conn
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
+            yield conn; conn.commit()
+        except:
+            conn.rollback(); raise
         finally:
             conn.close()
     else:
         conn = sqlite3.connect(SQLITE_PATH)
         conn.row_factory = sqlite3.Row
         try:
-            yield conn
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
+            yield conn; conn.commit()
+        except:
+            conn.rollback(); raise
         finally:
             conn.close()
 
-def init_db():
-    """Create tables if they don't exist."""
-    with get_db() as conn:
-        cur = conn.cursor()
-        if USE_POSTGRES:
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS users (
-                    email TEXT PRIMARY KEY,
-                    password_hash TEXT NOT NULL,
-                    created_at TIMESTAMP DEFAULT NOW()
-                )
-            """)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS repos (
-                    email TEXT NOT NULL,
-                    company_key TEXT NOT NULL,
-                    data JSONB NOT NULL,
-                    updated_at TIMESTAMP DEFAULT NOW(),
-                    PRIMARY KEY (email, company_key)
-                )
-            """)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS settings (
-                    email TEXT NOT NULL,
-                    name TEXT NOT NULL,
-                    value TEXT NOT NULL DEFAULT '',
-                    PRIMARY KEY (email, name)
-                )
-            """)
-        else:
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS users (
-                    email TEXT PRIMARY KEY,
-                    password_hash TEXT NOT NULL,
-                    created_at TEXT DEFAULT (datetime('now'))
-                )
-            """)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS repos (
-                    email TEXT NOT NULL,
-                    company_key TEXT NOT NULL,
-                    data TEXT NOT NULL,
-                    updated_at TEXT DEFAULT (datetime('now')),
-                    PRIMARY KEY (email, company_key)
-                )
-            """)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS settings (
-                    email TEXT NOT NULL,
-                    name TEXT NOT NULL,
-                    value TEXT NOT NULL DEFAULT '',
-                    PRIMARY KEY (email, name)
-                )
-            """)
+PH = "%s" if USE_POSTGRES else "?"
 
-# Run migrations on startup
+def init_db():
+    with get_db() as db:
+        c = db.cursor()
+        if USE_POSTGRES:
+            c.execute("""CREATE TABLE IF NOT EXISTS users (
+                email TEXT PRIMARY KEY, password_hash TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT NOW())""")
+            c.execute("""CREATE TABLE IF NOT EXISTS repos (
+                email TEXT NOT NULL, company_key TEXT NOT NULL,
+                data JSONB NOT NULL, updated_at TIMESTAMP DEFAULT NOW(),
+                PRIMARY KEY (email, company_key))""")
+            c.execute("""CREATE TABLE IF NOT EXISTS settings (
+                email TEXT NOT NULL, name TEXT NOT NULL,
+                value TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (email, name))""")
+        else:
+            c.execute("""CREATE TABLE IF NOT EXISTS users (
+                email TEXT PRIMARY KEY, password_hash TEXT NOT NULL,
+                created_at TEXT DEFAULT (datetime('now')))""")
+            c.execute("""CREATE TABLE IF NOT EXISTS repos (
+                email TEXT NOT NULL, company_key TEXT NOT NULL,
+                data TEXT NOT NULL, updated_at TEXT DEFAULT (datetime('now')),
+                PRIMARY KEY (email, company_key))""")
+            c.execute("""CREATE TABLE IF NOT EXISTS settings (
+                email TEXT NOT NULL, name TEXT NOT NULL,
+                value TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (email, name))""")
+
 init_db()
 
 def hash_pw(pw):
     return hashlib.sha256(pw.encode()).hexdigest()
 
-# ---- user helpers -------------------------------------------------------------
-
+# DB helpers
 def db_get_user(email):
-    with get_db() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT email, password_hash FROM users WHERE email = %s" if USE_POSTGRES else
-                    "SELECT email, password_hash FROM users WHERE email = ?", (email,))
-        row = cur.fetchone()
-        return dict(row) if row else None
+    try:
+        with get_db() as db:
+            c = db.cursor()
+            c.execute(f"SELECT email,password_hash FROM users WHERE email={PH}", (email,))
+            row = c.fetchone()
+            return dict(row) if row else None
+    except: return None
 
-def db_create_user(email, password):
-    with get_db() as conn:
-        cur = conn.cursor()
-        cur.execute(
-            "INSERT INTO users (email, password_hash) VALUES (%s, %s)" if USE_POSTGRES else
-            "INSERT INTO users (email, password_hash) VALUES (?, ?)",
-            (email, hash_pw(password))
-        )
+def db_create_user(email, pw):
+    with get_db() as db:
+        c = db.cursor()
+        c.execute(f"INSERT INTO users(email,password_hash) VALUES({PH},{PH})", (email, hash_pw(pw)))
 
 def db_get_repo(email):
-    with get_db() as conn:
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT company_key, data FROM repos WHERE email = %s" if USE_POSTGRES else
-            "SELECT company_key, data FROM repos WHERE email = ?",
-            (email,)
-        )
-        rows = cur.fetchall()
-        result = {}
-        for row in rows:
-            key = row[0] if USE_POSTGRES else row["company_key"]
-            raw = row[1] if USE_POSTGRES else row["data"]
-            data = raw if isinstance(raw, dict) else json.loads(raw)
-            result[key] = data
-        return result
+    try:
+        with get_db() as db:
+            c = db.cursor()
+            c.execute(f"SELECT company_key,data FROM repos WHERE email={PH}", (email,))
+            rows = c.fetchall()
+            result = {}
+            for row in rows:
+                k = row[0] if USE_POSTGRES else row["company_key"]
+                v = row[1] if USE_POSTGRES else row["data"]
+                result[k] = v if isinstance(v, dict) else json.loads(v)
+            return result
+    except: return {}
 
 def db_save_entry(email, key, data):
-    with get_db() as conn:
-        cur = conn.cursor()
-        payload = json.dumps(data, ensure_ascii=False) if not USE_POSTGRES else json.dumps(data)
+    payload = json.dumps(data, ensure_ascii=False)
+    with get_db() as db:
+        c = db.cursor()
         if USE_POSTGRES:
-            cur.execute("""
-                INSERT INTO repos (email, company_key, data, updated_at)
-                VALUES (%s, %s, %s::jsonb, NOW())
-                ON CONFLICT (email, company_key) DO UPDATE
-                SET data = EXCLUDED.data, updated_at = NOW()
-            """, (email, key, payload))
+            c.execute("""INSERT INTO repos(email,company_key,data,updated_at)
+                VALUES(%s,%s,%s::jsonb,NOW())
+                ON CONFLICT(email,company_key) DO UPDATE
+                SET data=EXCLUDED.data,updated_at=NOW()""", (email, key, payload))
         else:
-            cur.execute("""
-                INSERT INTO repos (email, company_key, data, updated_at)
-                VALUES (?, ?, ?, datetime('now'))
-                ON CONFLICT (email, company_key) DO UPDATE
-                SET data = excluded.data, updated_at = datetime('now')
-            """, (email, key, payload))
+            c.execute("""INSERT INTO repos(email,company_key,data,updated_at)
+                VALUES(?,?,?,datetime('now'))
+                ON CONFLICT(email,company_key) DO UPDATE
+                SET data=excluded.data,updated_at=datetime('now')""", (email, key, payload))
 
 def db_delete_entry(email, key):
-    with get_db() as conn:
-        cur = conn.cursor()
-        cur.execute(
-            "DELETE FROM repos WHERE email = %s AND company_key = %s" if USE_POSTGRES else
-            "DELETE FROM repos WHERE email = ? AND company_key = ?",
-            (email, key)
-        )
+    with get_db() as db:
+        c = db.cursor()
+        c.execute(f"DELETE FROM repos WHERE email={PH} AND company_key={PH}", (email, key))
 
-# ---- auth routes --------------------------------------------------------------
+def db_get_setting(email, name):
+    try:
+        with get_db() as db:
+            c = db.cursor()
+            c.execute(f"SELECT value FROM settings WHERE email={PH} AND name={PH}", (email, name))
+            row = c.fetchone()
+            return (row[0] if USE_POSTGRES else row["value"]) if row else None
+    except: return None
 
+def db_save_setting(email, name, value):
+    with get_db() as db:
+        c = db.cursor()
+        if USE_POSTGRES:
+            c.execute("""INSERT INTO settings(email,name,value) VALUES(%s,%s,%s)
+                ON CONFLICT(email,name) DO UPDATE SET value=EXCLUDED.value""", (email, name, value))
+        else:
+            c.execute("""INSERT INTO settings(email,name,value) VALUES(?,?,?)
+                ON CONFLICT(email,name) DO UPDATE SET value=excluded.value""", (email, name, value))
+
+# ---------------------------------------------------------------------------
+# Auth routes
+# ---------------------------------------------------------------------------
 @app.route("/api/signup", methods=["POST"])
 def signup():
     d = request.json or {}
     email = (d.get("email") or "").strip().lower()
-    pw = d.get("password") or ""
+    pw    = d.get("password") or ""
     if not email or not pw:
         return jsonify(error="Email and password required"), 400
     if len(pw) < 8:
@@ -220,7 +189,7 @@ def signup():
     try:
         db_create_user(email, pw)
     except Exception as e:
-        return jsonify(error="Could not create account: " + str(e)), 500
+        return jsonify(error=f"Could not create account: {e}"), 500
     session.permanent = True
     session["email"] = email
     return jsonify(ok=True, email=email)
@@ -229,8 +198,8 @@ def signup():
 def login():
     d = request.json or {}
     email = (d.get("email") or "").strip().lower()
-    pw = d.get("password") or ""
-    user = db_get_user(email)
+    pw    = d.get("password") or ""
+    user  = db_get_user(email)
     if not user:
         return jsonify(error="No account found with this email"), 401
     if user["password_hash"] != hash_pw(pw):
@@ -251,8 +220,9 @@ def me():
         return jsonify(error="Not logged in"), 401
     return jsonify(email=email)
 
-# ---- repo routes --------------------------------------------------------------
-
+# ---------------------------------------------------------------------------
+# Repo routes
+# ---------------------------------------------------------------------------
 @app.route("/api/repo")
 def get_repo():
     email = session.get("email")
@@ -268,58 +238,39 @@ def delete_entry(key):
     db_delete_entry(email, key)
     return jsonify(ok=True)
 
-# ---- scraper ------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Settings routes
+# ---------------------------------------------------------------------------
+@app.route("/api/settings")
+def get_settings():
+    email = session.get("email")
+    if not email:
+        return jsonify(error="Not logged in"), 401
+    user_key = db_get_setting(email, "anthropic_key") or ""
+    return jsonify(ai_enabled=True, has_user_key=bool(user_key))
 
-HEADERS = {
+@app.route("/api/settings/apikey", methods=["POST"])
+def save_apikey():
+    email = session.get("email")
+    if not email:
+        return jsonify(error="Not logged in"), 401
+    d = request.json or {}
+    key = (d.get("key") or "").strip()
+    if key and not key.startswith("sk-ant-"):
+        return jsonify(error="Key should start with sk-ant-"), 400
+    db_save_setting(email, "anthropic_key", key)
+    return jsonify(ok=True, ai_enabled=True)
+
+# ---------------------------------------------------------------------------
+# Scraper helpers
+# ---------------------------------------------------------------------------
+FETCH_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9,sl;q=0.8,de;q=0.7",
 }
-
-CLIENT_PATH_RE = re.compile(
-    r"/(clients?|customers?|references?|testimonials?|portfolio|partners?|"
-    r"case-studies?|our-clients?|referencje|werk|realisations?|projets?|"
-    r"projekte?|realizacje|arbeiten|reference|stranke|nase-stranke|"
-    r"partnerji|klienti|referenzen|kunden|clientes?|referencias?|"
-    r"proyectos?|clienti|referenze|progetti|klijenti|partneri|"
-    r"klanten|referenties|opdrachtgevers|projecten|klienci|"
-    r"referencie|zakaznici|projekty|work|our-work|selected-work)(/|$)",
-    re.IGNORECASE,
-)
-
-CASE_STUDY_RE = re.compile(
-    r"/(case-studies?|portfolio|werk|projets?|projekte?|trabajo|lavori|"
-    r"realizacje|reference|references?|client|clients?|customers?|work|projects?|case)"
-    r"/([^/?#]{2,})",
-    re.IGNORECASE,
-)
-
-SKIP = {
-    "home","about","contact","services","blog","news","products","pricing",
-    "login","signup","privacy","terms","faq","search","menu","loading",
-    "read more","learn more","see more","view all","next","previous","back",
-    "more","all","featured","selected","development","design","migration",
-    "redesign","maintenance","seo","optimization","integration","localization",
-    "webflow","case study","case studies","portfolio","our work","showing",
-    "out of","projects","clear all","filter","app development","trusted by",
-    "load more","get started","schedule","contact us","about us","our team",
-    "wordpress","shopify","squarespace","wix","drupal",
-}
-
-CLIENT_KW = [
-    "our clients","our customers","clients","references","testimonials",
-    "case studies","partners","who we work","trusted by","our portfolio",
-    "our work","selected work","featured clients","client work",
-    "nase stranke","nasi klienti","reference","stranke","partnerji",
-    "unsere kunden","referenzen","kunden","projekte",
-    "nos clients","references","temoignages",
-    "nuestros clientes","clientes","referencias",
-    "i nostri clienti","clienti","referenze",
-    "nasi klijenti","klijenti",
-    "onze klanten","klanten","referenties",
-    "nasi klienci","klienci","referencje",
-    "nasi klienti","zakaznici","referencie",
-]
+FETCH_TIMEOUT = 15
+HEAD_TIMEOUT  = 6
 
 TLD_LANG = {
     "si":"slovenian","de":"german","at":"german","ch":"german","fr":"french",
@@ -336,465 +287,327 @@ TLD_COUNTRY = {
     "dk":"Denmark","fi":"Finland",
 }
 
-def clean(text):
-    return re.sub(r"\s+", " ", (text or "")).strip().strip("-*>|#").strip()
-
-def is_name(text):
-    t = (text or "").strip()
-    if not t or len(t) < 2 or len(t) > 100: return False
-    if re.match(r"^(https?:|www\.|tel:|email:|@|[0-9]{4,})", t): return False
-    if t.lower() in SKIP: return False
-    if re.match(r"^(development|design|migration|redesign|seo|maintenance|"
-                r"optimization|integration|localization|app development|webflow|"
-                r"wordpress|shopify|squarespace|wix)$", t, re.I): return False
-    if not re.search(r"[a-zA-Z\u00c0-\u024f]", t): return False
-    return True
-
-def slug_to_name(slug):
-    return " ".join(w.capitalize() for w in re.split(r"[-_]", slug))
-
-def fetch_page(url):
-    r = requests.get(url, headers=HEADERS, timeout=15, allow_redirects=True)
+def fetch_url(url):
+    r = requests.get(url, headers=FETCH_HEADERS, timeout=FETCH_TIMEOUT, allow_redirects=True)
     r.raise_for_status()
-    return BeautifulSoup(r.text, "lxml"), r.url
+    return r.text, r.url
 
-def from_tables(soup):
-    out = []
-    for table in soup.find_all("table"):
-        rows = table.find_all("tr")
-        if len(rows) < 2: continue
-        hdrs = [c.get_text(strip=True).lower() for c in rows[0].find_all(["th","td"])]
-        name_re = re.compile(r"naziv|name|company|podjetje|firma|klient|client|stranka|organization|empresa|azienda", re.I)
-        ni = next((i for i,h in enumerate(hdrs) if name_re.search(h)), 0)
-        ii = next((i for i,h in enumerate(hdrs) if re.search(r"dejavnost|industry|sector|branch", h)), -1)
-        ci = next((i for i,h in enumerate(hdrs) if re.search(r"drzava|country|land|pays|paese", h)), -1)
-        xi = next((i for i,h in enumerate(hdrs) if re.search(r"mesto|city|stadt|ciudad|ville", h)), -1)
-        for row in rows[1:]:
-            cells = row.find_all(["td","th"])
-            if len(cells) <= ni: continue
-            name = clean(cells[ni].get_text())
-            if not is_name(name): continue
-            e = {"name": name, "source": "table"}
-            if ii >= 0 and len(cells) > ii:
-                v = clean(cells[ii].get_text())
-                if v: e["industry"] = v
-            if ci >= 0 and len(cells) > ci:
-                v = clean(cells[ci].get_text())
-                if v: e["country"] = v
-            if xi >= 0 and len(cells) > xi:
-                v = clean(cells[xi].get_text())
-                if v: e["city"] = v
-            out.append(e)
-    return out
-
-def from_case_links(soup, base):
-    out, seen = [], set()
-    for a in soup.find_all("a", href=True):
-        abs_url = urljoin(base, a["href"])
-        m = CASE_STUDY_RE.search(urlparse(abs_url).path)
-        if not m: continue
-        slug = m.group(2)
-        if not slug or slug.lower() in ("page","") or re.match(r"^\d+$", slug): continue
-        h = a.find(["h1","h2","h3","h4","h5","strong"])
-        txt = clean(h.get_text() if h else a.get_text())
-        txt = re.sub(r"\b(DEVELOPMENT|DESIGN|MIGRATION|REDESIGN|SEO|MAINTENANCE|"
-                     r"OPTIMIZATION|INTEGRATION|LOCALIZATION|APP DEVELOPMENT|WEBFLOW INTEGRATION)\b", "", txt).strip()
-        txt = re.sub(r"\s+", " ", txt).strip()
-        name = txt if (txt and is_name(txt)) else slug_to_name(slug)
-        if is_name(name) and name.lower() not in seen:
-            seen.add(name.lower())
-            out.append({"name": name, "source": "case study link"})
-    return out
-
-def from_headings(soup, url):
-    out, seen = [], set()
-    path = urlparse(url).path
-    if not CLIENT_PATH_RE.search(path): return out
-    skip_re = re.compile(r"^(all |our |featured |selected |recent |trusted |client |"
-                         r"case |portfolio |project |reference |partner |customer |"
-                         r"webflow |more |load |see |view )", re.I)
-    for tag in ["h2","h3"]:
-        for h in soup.find_all(tag):
-            name = clean(h.get_text())
-            if not is_name(name): continue
-            if skip_re.match(name): continue
-            if name.lower() not in seen:
-                seen.add(name.lower())
-                out.append({"name": name, "source": "heading"})
-    return out
-
-def from_sections(soup):
-    out, seen = [], set()
-    def add(name, src):
-        name = clean(name)
-        if is_name(name) and name.lower() not in seen:
-            seen.add(name.lower()); out.append({"name": name, "source": src})
-    for el in soup.find_all(["h1","h2","h3","h4","h5","h6","p"]):
-        txt = el.get_text(strip=True).lower()
-        if len(txt) > 120: continue
-        if not any(kw in txt for kw in CLIENT_KW): continue
-        container = el.find_parent(["section","article","div"]) or el.parent
-        if not container: continue
-        for li in container.find_all("li"): add(li.get_text(), "list")
-        for card in container.find_all(class_=re.compile(r"client|customer|partner|reference|brand|testimonial", re.I)):
-            h = card.find(["h2","h3","h4","h5","strong","b"])
-            add((h or card).get_text().split("\n")[0], "card")
-    gc = re.compile(r"client|customer|partner|reference|logo|brand|testimonial|stranke|klienti|referenzen|clientes|clienti|klanten|klienci", re.I)
-    for container in soup.find_all(class_=gc):
-        for el in container.find_all(["li","h3","h4","h5","strong"]):
-            add(el.get_text(), "grid")
-    return out
-
-def from_logos(soup):
-    out, seen = [], set()
-    for img in soup.find_all("img"):
-        src = img.get("src","") or ""
-        alt = (img.get("alt","") or "").strip()
-        title = (img.get("title","") or "").strip()
-        ctx = " ".join([src, str(img.get("class","") or "")])
-        if not re.search(r"logo|client|partner|reference|brand|customer|sponsor", ctx, re.I): continue
-        def try_add(n, s):
-            n = clean(n)
-            if is_name(n) and 2 < len(n) < 80 and n.lower() not in seen:
-                seen.add(n.lower()); out.append({"name": n, "source": s})
-        if alt: try_add(alt, "logo alt")
-        elif title: try_add(title, "logo title")
-        else:
-            fname = src.split("/")[-1].split("?")[0]
-            fname = re.sub(r"\.(png|jpg|jpeg|svg|webp|gif|avif)$","",fname,flags=re.I)
-            fname = re.sub(r"[-_]"," ", re.sub(r"logo|client|partner|\d{2,}|thumb|og\d?","",fname,flags=re.I)).strip()
-            if fname: try_add(fname.title(), "logo filename")
-    return out
-
-def from_jsonld(soup):
-    out = []
-    for s in soup.find_all("script", type="application/ld+json"):
-        try:
-            items = json.loads(s.string or "")
-            if not isinstance(items, list): items = [items]
-            for item in items:
-                if item.get("@type") == "ItemList":
-                    for el in item.get("itemListElement",[]):
-                        name = el.get("name") or (el.get("item") or {}).get("name")
-                        if name and is_name(name):
-                            out.append({"name": clean(name), "source": "json-ld"})
-        except Exception:
-            pass
-    return out
-
-def pagination_urls(base, soup):
-    urls = set()
-    from urllib.parse import parse_qs, urlencode
-    parsed = urlparse(base)
-    for a in soup.find_all("a", href=True):
-        txt = a.get_text(strip=True).lower()
-        href = a["href"]
-        if re.search(r"next", txt) or re.search(r"[?&](\w+_)?page=\d", href):
-            try:
-                candidate = urljoin(base, href)
-                if candidate != base: urls.add(candidate)
-            except Exception:
-                pass
-    params = dict(parse_qs(parsed.query))
-    for p in range(2, 8):
-        params["page"] = [str(p)]
-        flat = "&".join(f"{k}={v[0]}" for k,v in params.items())
-        urls.add(parsed._replace(query=flat).geturl())
-    return [u for u in urls if u != base][:8]
-
-def discover_urls(base, soup):
-    origin = urlparse(base).netloc
-    found = []
-    for a in soup.find_all("a", href=True):
-        abs_url = urljoin(base, a["href"])
-        if urlparse(abs_url).netloc != origin: continue
-        if CLIENT_PATH_RE.search(urlparse(abs_url).path):
-            found.append(abs_url)
-    return list(dict.fromkeys(found))[:8]
-
-def probe_paths(origin):
-    paths = ["clients","customers","references","reference","testimonials","portfolio",
-             "partners","case-studies","werk","projets","projekte","stranke","klienti",
-             "referenzen","kunden","clientes","clienti","klanten","klienci"]
-    found = []
-    for p in paths:
-        url = f"{origin}/{p}/"
-        try:
-            r = requests.head(url, headers=HEADERS, timeout=5, allow_redirects=True)
-            if r.status_code < 400: found.append(url)
-        except Exception:
-            pass
-    return found[:5]
+def page_text(html, max_chars=8000):
+    """Strip boilerplate, return clean readable text."""
+    soup = BeautifulSoup(html, "lxml")
+    for tag in soup(["script","style","nav","footer","head","noscript","svg","iframe"]):
+        tag.decompose()
+    # Keep structured text — tables, headings, paragraphs
+    text = soup.get_text(separator="\n", strip=True)
+    # Collapse blank lines
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text[:max_chars]
 
 def dedupe(clients):
     seen, out = {}, []
     for c in clients:
-        k = (c["name"] or "").lower().strip()
+        k = (c.get("name") or "").lower().strip()
         if k and k not in seen:
             seen[k] = True; out.append(c)
     return out
 
-def scrape_one(url, logs):
-    logs.append(f"Fetching: {url}")
-    soup, final = fetch_page(url)
-    results = (
-        from_tables(soup) +
-        from_case_links(soup, final) +
-        from_headings(soup, final) +
-        from_sections(soup) +
-        from_jsonld(soup) +
-        from_logos(soup)
-    )
-    t = len(from_tables(soup))
-    cs = len(from_case_links(soup, final))
-    h = len(from_headings(soup, final))
-    sec = len(from_sections(soup))
-    lg = len(from_logos(soup))
-    logs.append(f"  -> tables:{t} case-links:{cs} headings:{h} sections:{sec} logos:{lg}")
-    return results, soup, final
+# ---------------------------------------------------------------------------
+# AI pipeline
+# ---------------------------------------------------------------------------
+ANTHROPIC_API = "https://api.anthropic.com/v1/messages"
+BUILTIN_KEY   = os.environ.get("ANTHROPIC_API_KEY", "")
 
+def get_api_key(user_key=None):
+    return user_key or BUILTIN_KEY or ""
+
+def claude(prompt, api_key, max_tokens=8000, use_search=False):
+    """Call Claude, return text. Raises on failure."""
+    body = {
+        "model": "claude-sonnet-4-20250514",
+        "max_tokens": max_tokens,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    if use_search:
+        body["tools"] = [{"type": "web_search_20250305", "name": "web_search"}]
+    r = requests.post(
+        ANTHROPIC_API,
+        headers={
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        },
+        json=body,
+        timeout=180,
+    )
+    r.raise_for_status()
+    data = r.json()
+    if "error" in data:
+        raise RuntimeError(data["error"].get("message", "Claude API error"))
+    return "".join(b.get("text","") for b in data.get("content",[]) if b.get("type")=="text")
+
+def parse_json(text):
+    """Extract first JSON object from text."""
+    text = re.sub(r"```json|```", "", text).strip()
+    m = re.search(r"\{[\s\S]*\}", text)
+    if not m:
+        raise ValueError("No JSON found in response")
+    return json.loads(m.group())
+
+# ---------------------------------------------------------------------------
+# Main scrape pipeline
+# ---------------------------------------------------------------------------
 def run_scrape(input_url, logs, user_api_key=None):
+    """
+    Three-phase intelligence pipeline:
+    1. AI web search discovers ALL client/reference pages
+    2. Fetch full HTML content of each page
+    3. AI analyses all content, returns structured client database
+    """
     url = input_url.strip()
-    if not re.match(r"^https?://", url): url = "https://" + url
+    if not re.match(r"^https?://", url):
+        url = "https://" + url
+
     parsed = urlparse(url)
     domain = parsed.netloc.lstrip("www.")
-    origin = f"{parsed.scheme}://{parsed.netloc}"
-    tld = domain.split(".")[-1].lower()
-    lang = TLD_LANG.get(tld, "english")
+    tld    = domain.split(".")[-1].lower()
+    lang   = TLD_LANG.get(tld, "english")
     country = TLD_COUNTRY.get(tld, "")
+
+    api_key = get_api_key(user_api_key)
+    if not api_key:
+        return _build_result(domain, domain.split(".")[0].title(), "", lang, country, [], [],
+                             error="No Anthropic API key set. Add ANTHROPIC_API_KEY on Railway.")
 
     logs.append(f"Target: {url}")
     logs.append(f"Domain: {domain} | Language: {lang}")
 
-    is_client = bool(CLIENT_PATH_RE.search(parsed.path))
-    all_clients, scraped, home_soup = [], [], None
+    # ── Phase 1: AI web search to discover all pages ────────────────────────
+    logs.append("Phase 1: AI searching for all client/reference pages...")
 
-    if is_client:
-        client_urls = [url]
-        logs.append("Direct client/reference page detected")
-    else:
-        logs.append("Fetching homepage to find client pages...")
-        try:
-            hp_clients, home_soup, _ = scrape_one(url, logs)
-            all_clients.extend(hp_clients)
-            client_urls = discover_urls(url, home_soup)
-            logs.append(f"Found {len(client_urls)} client page link(s)")
-        except Exception as e:
-            logs.append(f"Homepage failed: {e}")
-            home_soup, client_urls = None, []
-        if not client_urls:
-            logs.append("Probing common paths...")
-            client_urls = probe_paths(origin)
+    discovery_prompt = f"""Research the company at {url}
 
-    for cu in client_urls:
-        if cu in scraped: continue
-        try:
-            clients, soup, final = scrape_one(cu, logs)
-            all_clients.extend(clients)
-            scraped.append(cu)
-            time.sleep(0.3)
-            for pu in pagination_urls(cu, soup):
-                if pu in scraped: continue
-                try:
-                    pg, _, _ = scrape_one(pu, logs)
-                    if pg:
-                        all_clients.extend(pg)
-                        scraped.append(pu)
-                        time.sleep(0.3)
-                except Exception as e:
-                    logs.append(f"  Pagination failed: {e}")
-        except Exception as e:
-            logs.append(f"  Failed {cu}: {e}")
+Find EVERY page on {domain} that contains client names, case studies, references, testimonials, portfolio projects, or technology partners.
 
-    deduped = dedupe(all_clients)
-    logs.append(f"Done: {len(deduped)} raw candidates from {len(scraped)} page(s)")
+Search strategies:
+1. Their main reference/clients/portfolio page (try: {domain}/reference, /clients, /case-studies, /portfolio, /references, /stranke, /klienti, /referenzen, /referencje)
+2. Individual case study sub-pages
+3. Blog posts that describe client projects  
+4. Job postings (these often list real client names as examples of work)
+5. Technologies/partners page
+6. Any industry-specific reference sub-sections
+7. Homepage (logos carousel, testimonials section)
 
-    # Get company name first so AI has context
-    comp_name, comp_desc = "", ""
-    if home_soup:
-        og_title = home_soup.find("meta", property="og:title")
-        title_tag = home_soup.find("title")
-        og_desc = home_soup.find("meta", property="og:description")
-        meta_desc = home_soup.find("meta", attrs={"name":"description"})
-        raw_name = (og_title or {}).get("content","") or (title_tag.get_text() if title_tag else "")
-        comp_name = re.split(r"[|\-\u2013\u2014]", raw_name)[0].strip()[:80]
-        comp_desc = ((og_desc or {}).get("content","") or (meta_desc or {}).get("content",""))[:200]
+Search in {lang} AND English. Be thorough — check multiple search queries.
 
-    if not comp_name:
-        comp_name = domain.split(".")[0].replace("-"," ").title()
-
-    # AI validation + cleaning pass
-    deduped = ai_clean_clients(deduped, comp_name, domain, logs, extra_key=user_api_key)
-    logs.append(f"Final: {len(deduped)} validated clients")
-
-    key = re.sub(r"[^a-z0-9.-]", "", domain)
-    return {
-        "key": key,
-        "company_name": comp_name,
-        "company_domain": domain,
-        "company_description": comp_desc,
-        "detected_language": lang,
-        "detected_country": country,
-        "clients": deduped,
-        "sources_checked": scraped,
-        "scraped_at": datetime.now().isoformat(),
-        "ai_cleaned": bool(os.environ.get("ANTHROPIC_API_KEY")),
-    }
-
-
-
-def db_get_setting(email, name):
-    try:
-        with get_db() as conn:
-            cur = conn.cursor()
-            cur.execute(
-                "SELECT value FROM settings WHERE email = %s AND name = %s" if USE_POSTGRES else
-                "SELECT value FROM settings WHERE email = ? AND name = ?",
-                (email, name)
-            )
-            row = cur.fetchone()
-            return (row[0] if USE_POSTGRES else row["value"]) if row else None
-    except Exception:
-        return None
-
-def db_save_setting(email, name, value):
-    with get_db() as conn:
-        cur = conn.cursor()
-        if USE_POSTGRES:
-            cur.execute("""
-                INSERT INTO settings (email, name, value)
-                VALUES (%s, %s, %s)
-                ON CONFLICT (email, name) DO UPDATE SET value = EXCLUDED.value
-            """, (email, name, value))
-        else:
-            cur.execute("""
-                INSERT INTO settings (email, name, value)
-                VALUES (?, ?, ?)
-                ON CONFLICT (email, name) DO UPDATE SET value = excluded.value
-            """, (email, name, value))
-
-# ---- AI cleaning layer --------------------------------------------------------
-# Called after raw scraping. Uses Claude to validate, clean and enrich clients.
-
-ANTHROPIC_API = "https://api.anthropic.com/v1/messages"
-
-def ai_clean_clients(raw_clients, company_name, company_domain, logs, extra_key=None):
-    """
-    Send raw scraped candidates to Claude.
-    Returns cleaned, validated, enriched list.
-    Falls back to raw list if API key missing or call fails.
-    """
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "") or (extra_key or "")
-    if not api_key:
-        logs.append("AI cleaning skipped - add your Anthropic API key in Settings to enable")
-        return raw_clients
-
-    if not raw_clients:
-        return raw_clients
-
-    logs.append(f"AI cleaning: validating {len(raw_clients)} candidates...")
-
-    # Build compact candidate list for the prompt
-    candidates = []
-    for i, c in enumerate(raw_clients):
-        entry = {"i": i, "name": c.get("name",""), "source": c.get("source","")}
-        if c.get("industry"): entry["industry"] = c["industry"]
-        candidates.append(entry)
-
-    prompt = f"""You are a data cleaning specialist for a client intelligence database.
-
-The company being analysed is: "{company_name}" ({company_domain})
-
-Below is a raw list of candidate client names scraped from their website.
-Your job is to clean and validate each one.
-
-RAW CANDIDATES:
-{json.dumps(candidates, ensure_ascii=False)}
-
-For each candidate decide:
-1. KEEP - it is a real client/customer/partner company name
-2. REMOVE - it is noise: a page headline, navigation item, generic word, service tag,
-   technology name, decorative text, or clearly not a company
-
-Also:
-- If a name is a case study TITLE (e.g. "How Acme grew 3x") extract just the company name ("Acme")
-- If a name has legal suffixes that are inconsistent (e.g. "NLB" and "NLB d.d.") keep the fuller version
-- Normalise capitalisation (e.g. "acme corp" -> "Acme Corp")
-- If you can infer the industry from context, add it
-- Give each kept entry a confidence score 0-100
-
-Return ONLY valid JSON, no markdown, no explanation:
+Return ONLY valid JSON:
 {{
-  "cleaned": [
+  "company_name": "Official company name",
+  "company_description": "One sentence what they do",
+  "pages": [
+    {{"url": "https://...", "type": "one of: homepage|case_studies_index|case_study|reference_list|testimonials|blog_post|job_listing|partners", "description": "what client info it contains"}}
+  ]
+}}"""
+
+    comp_name = domain.split(".")[0].replace("-"," ").title()
+    comp_desc = ""
+    pages_to_fetch = []
+
+    try:
+        disc_text = claude(discovery_prompt, api_key, max_tokens=4000, use_search=True)
+        disc = parse_json(disc_text)
+        comp_name = disc.get("company_name", comp_name)
+        comp_desc = disc.get("company_description", "")
+        pages_to_fetch = disc.get("pages", [])
+        logs.append(f"  Found {len(pages_to_fetch)} pages to analyse:")
+        for p in pages_to_fetch:
+            logs.append(f"    [{p.get('type','?')}] {p.get('url','')} — {p.get('description','')}")
+    except Exception as e:
+        logs.append(f"  Discovery failed: {e}. Falling back to input URL.")
+        pages_to_fetch = [{"url": url, "type": "homepage", "description": "direct input"}]
+
+    # Deduplicate URLs, keep input URL as fallback
+    seen_urls = set()
+    unique_pages = []
+    for p in pages_to_fetch:
+        u = p.get("url","")
+        if u and u not in seen_urls:
+            seen_urls.add(u)
+            unique_pages.append(p)
+    if not unique_pages:
+        unique_pages = [{"url": url, "type": "homepage", "description": "direct input"}]
+
+    # ── Phase 2: Fetch HTML content ──────────────────────────────────────────
+    logs.append(f"Phase 2: Fetching content from {len(unique_pages)} page(s)...")
+
+    page_contents = []
+    scraped_urls  = []
+
+    for page_info in unique_pages[:15]:
+        page_url = page_info.get("url","")
+        if not page_url or not page_url.startswith("http"):
+            continue
+        try:
+            html, final_url = fetch_url(page_url)
+            text = page_text(html, max_chars=8000)
+            page_contents.append({
+                "url":  final_url,
+                "type": page_info.get("type","unknown"),
+                "desc": page_info.get("description",""),
+                "text": text,
+            })
+            scraped_urls.append(final_url)
+            logs.append(f"  OK: {final_url} ({len(text)} chars)")
+            time.sleep(0.5)
+        except requests.HTTPError as e:
+            code = e.response.status_code if e.response is not None else 0
+            logs.append(f"  HTTP {code}: {page_url}")
+        except Exception as e:
+            logs.append(f"  Failed: {page_url} — {e}")
+
+    if not page_contents:
+        logs.append("Could not fetch any pages.")
+        return _build_result(domain, comp_name, comp_desc, lang, country, [], scraped_urls)
+
+    # ── Phase 3: AI analyses all content ─────────────────────────────────────
+    logs.append("Phase 3: AI analysing content to extract verified clients...")
+
+    # Build the full content block
+    all_content = ""
+    for i, p in enumerate(page_contents):
+        all_content += f"\n\n{'='*60}\nPAGE {i+1} | {p['url']} | type: {p['type']}\n{'='*60}\n{p['text']}"
+
+    analysis_prompt = f"""You are a senior business intelligence analyst building a verified client database for a sales team.
+
+COMPANY: {comp_name} ({domain})
+This company sells products/services. We want to know WHO their clients are.
+
+SCRAPED CONTENT FROM {len(page_contents)} PAGES:
+{all_content[:35000]}
+
+YOUR TASK:
+Extract every real client/customer this company has publicly worked with. Be thorough and precise.
+
+WHAT TO EXTRACT AS CLIENTS:
+- Companies explicitly named as clients, customers, or project recipients
+- Names extracted from case study titles: "We built X for Acme Corp" → client is "Acme Corp"
+- Names from reference lists (even just a company name in a list = valid client)
+- Names from logo walls (alt text naming real companies)
+- Names mentioned in testimonial quotes
+- Names from job postings as "clients we work with" or project examples
+
+WHAT TO MARK AS technology_partner (NOT clients):
+- Software vendors they resell or are certified for (Pimcore, Shopware, SAP, Salesforce, etc.)
+- Platforms they partner with (Google, Meta, HubSpot, etc.)
+- Hardware suppliers they integrate with
+
+WHAT TO EXCLUDE COMPLETELY (not clients, not partners):
+- Navigation/menu items
+- Service/product names
+- The company's own name and subsidiaries
+- Generic words, slogans, contact info
+- Certifications and awards
+
+EXTRACTION RULES:
+1. From case study headlines: extract ONLY the client company name
+   "Za Žak smo povečali prihodek za 80%" → name: "Žak"
+   "How Intersport expanded to 4 markets" → name: "Intersport"
+   "Custom PIM for SIP Mehanizacija" → name: "SIP Mehanizacija"
+2. Normalise names: fix capitalisation, remove trailing punctuation
+3. Deduplicate: same company in logo + case study = ONE entry
+4. For each client, write a specific evidence note (what project/relationship)
+
+Return ONLY valid JSON, absolutely no markdown or explanation:
+{{
+  "clients": [
     {{
-      "i": <original index>,
-      "name": "Cleaned Company Name",
-      "industry": "industry or empty string",
-      "confidence": 95,
-      "note": "optional short note e.g. extracted from case study title"
+      "name": "Exact Company Name",
+      "industry": "their industry sector",
+      "country": "country (guess from context/language/domain)",
+      "source_type": "case_study|reference_list|logo|testimonial|blog|job_listing",
+      "evidence": "One specific sentence about the project or relationship",
+      "confidence": 95
     }}
   ],
-  "removed": [<list of original indexes that were noise>],
-  "summary": "one sentence summary of what was found and removed"
+  "technology_partners": [
+    {{
+      "name": "Partner Name",
+      "role": "What the partnership is"
+    }}
+  ],
+  "summary": "Found X clients across Y pages. [Key industries and notes]"
 }}"""
 
     try:
-        resp = requests.post(
-            ANTHROPIC_API,
-            headers={
-                "x-api-key": api_key,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            },
-            json={
-                "model": "claude-haiku-4-5-20251001",
-                "max_tokens": 4096,
-                "messages": [{"role": "user", "content": prompt}],
-            },
-            timeout=60,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        text = "".join(b.get("text","") for b in data.get("content",[]) if b.get("type")=="text")
-        text = re.sub(r"```json|```", "", text).strip()
-        m = re.search(r"\{[\s\S]*\}", text)
-        if not m:
-            raise ValueError("No JSON in AI response")
-        result = json.loads(m.group())
+        analysis_text = claude(analysis_prompt, api_key, max_tokens=8000)
+        result = parse_json(analysis_text)
 
-        removed_set = set(result.get("removed", []))
-        cleaned_map = {c["i"]: c for c in result.get("cleaned", [])}
-        summary = result.get("summary", "")
+        raw_clients  = result.get("clients", [])
+        tech_partners = result.get("technology_partners", [])
+        summary      = result.get("summary", "")
 
-        out = []
-        for orig_idx, orig in enumerate(raw_clients):
-            if orig_idx in removed_set:
+        # Build final client list
+        clients = []
+        for c in raw_clients:
+            if not c.get("name","").strip():
                 continue
-            cleaned = cleaned_map.get(orig_idx)
-            if cleaned:
-                entry = dict(orig)
-                entry["name"] = cleaned.get("name", orig.get("name",""))
-                if cleaned.get("industry"):
-                    entry["industry"] = cleaned["industry"]
-                entry["confidence"] = cleaned.get("confidence", 80)
-                if cleaned.get("note"):
-                    entry["ai_note"] = cleaned["note"]
-                out.append(entry)
-            else:
-                out.append(dict(orig))
-        kept = len(out)
-        removed = len(raw_clients) - kept
-        logs.append(f"AI cleaning: kept {kept}, removed {removed} noise entries")
+            clients.append({
+                "name":       c.get("name","").strip(),
+                "industry":   c.get("industry",""),
+                "country":    c.get("country",""),
+                "source":     c.get("source_type","reference_list"),
+                "ai_note":    c.get("evidence",""),
+                "confidence": c.get("confidence", 80),
+            })
+
+        for p in tech_partners:
+            if not p.get("name","").strip():
+                continue
+            clients.append({
+                "name":       p.get("name","").strip(),
+                "industry":   "Technology vendor",
+                "country":    "",
+                "source":     "technology_partner",
+                "ai_note":    p.get("role",""),
+                "confidence": 99,
+            })
+
+        clients = dedupe(clients)
+        real_count = len([c for c in clients if c["source"] != "technology_partner"])
+        partner_count = len([c for c in clients if c["source"] == "technology_partner"])
+        logs.append(f"  Extracted {real_count} clients + {partner_count} technology partners")
         if summary:
-            logs.append(f"AI summary: {summary}")
-        return out
+            logs.append(f"  {summary}")
+
+        return _build_result(domain, comp_name, comp_desc, lang, country, clients, scraped_urls)
 
     except Exception as e:
-        logs.append(f"AI cleaning failed ({e}), using raw data")
-        return raw_clients
+        logs.append(f"AI analysis failed: {e}")
+        return _build_result(domain, comp_name, comp_desc, lang, country, [], scraped_urls,
+                             error=str(e))
 
-# ---- scrape API ---------------------------------------------------------------
 
+def _build_result(domain, comp_name, comp_desc, lang, country, clients, scraped_urls, error=None):
+    key = re.sub(r"[^a-z0-9.-]", "", domain)
+    r = {
+        "key":                key,
+        "company_name":       comp_name,
+        "company_domain":     domain,
+        "company_description": comp_desc,
+        "detected_language":  lang,
+        "detected_country":   country,
+        "clients":            clients,
+        "sources_checked":    scraped_urls,
+        "scraped_at":         datetime.now().isoformat(),
+        "ai_cleaned":         True,
+    }
+    if error:
+        r["error"] = error
+    return r
+
+
+# ---------------------------------------------------------------------------
+# Scrape API route
+# ---------------------------------------------------------------------------
 @app.route("/api/scrape", methods=["POST"])
 def scrape_endpoint():
     email = session.get("email")
@@ -804,46 +617,27 @@ def scrape_endpoint():
     url = (d.get("url") or "").strip()
     if not url:
         return jsonify(error="URL required"), 400
+
     logs = []
     try:
-        user_api_key = db_get_setting(email, "anthropic_key") or ""
-        result = run_scrape(url, logs, user_api_key=user_api_key)
+        user_key = db_get_setting(email, "anthropic_key") or ""
+        result   = run_scrape(url, logs, user_api_key=user_key)
         db_save_entry(email, result["key"], result)
         return jsonify(result=result, logs=logs)
+    except requests.exceptions.ConnectionError:
+        msg = f"Could not connect to {url} — site may be unreachable or blocking this server."
+        return jsonify(error=msg, logs=logs), 422
+    except requests.exceptions.Timeout:
+        msg = f"Timed out connecting to {url}."
+        return jsonify(error=msg, logs=logs), 422
     except Exception as e:
-        logs.append(f"Error: {e}")
+        logs.append(f"Unexpected error: {e}")
         return jsonify(error=str(e), logs=logs), 500
 
 
-# ---- settings routes ----------------------------------------------------------
-
-@app.route("/api/settings", methods=["GET"])
-def get_settings():
-    email = session.get("email")
-    if not email:
-        return jsonify(error="Not logged in"), 401
-    has_env_key = bool(os.environ.get("ANTHROPIC_API_KEY", ""))
-    user_key = db_get_setting(email, "anthropic_key") or ""
-    return jsonify(
-        ai_enabled=has_env_key or bool(user_key),
-        has_env_key=has_env_key,
-        has_user_key=bool(user_key),
-    )
-
-@app.route("/api/settings/apikey", methods=["POST"])
-def save_apikey():
-    email = session.get("email")
-    if not email:
-        return jsonify(error="Not logged in"), 401
-    d = request.json or {}
-    key = (d.get("key") or "").strip()
-    if key and not key.startswith("sk-ant-"):
-        return jsonify(error="Key should start with sk-ant-"), 400
-    db_save_setting(email, "anthropic_key", key)
-    return jsonify(ok=True, ai_enabled=bool(key))
-
-# ---- global error handlers ---------------------------------------------------
-
+# ---------------------------------------------------------------------------
+# Error handlers (always return JSON for API routes)
+# ---------------------------------------------------------------------------
 @app.errorhandler(404)
 def not_found(e):
     if request.path.startswith("/api/"):
@@ -856,10 +650,12 @@ def method_not_allowed(e):
 
 @app.errorhandler(500)
 def internal_error(e):
-    return jsonify(error="Internal server error: " + str(e)), 500
+    return jsonify(error=f"Internal server error: {e}"), 500
 
-# ---- frontend -----------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Frontend (served as string to avoid path issues on Railway)
+# ---------------------------------------------------------------------------
 INDEX_HTML = """
 <!DOCTYPE html>
 <html lang="en">
@@ -867,229 +663,219 @@ INDEX_HTML = """
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Client Intelligence</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 :root{
-  --bg0:#0e0e0f;
-  --bg1:#141416;
-  --bg2:#1a1a1d;
-  --bg3:#222226;
-  --bg4:#2a2a2f;
-  --border:#2e2e34;
-  --border2:#3a3a42;
-  --text0:#f0f0f0;
-  --text1:#b8b8c0;
-  --text2:#72727a;
-  --text3:#484850;
+  --bg0:#0e0e0f;--bg1:#141416;--bg2:#1a1a1d;--bg3:#222226;--bg4:#2a2a2f;
+  --border:#2e2e34;--border2:#3a3a42;
+  --text0:#f0f0f0;--text1:#b8b8c0;--text2:#72727a;--text3:#484850;
   --accent:#c8f135;
-  --blue:#4a9eff;
-  --green:#3dd68c;
-  --orange:#ff8c42;
-  --purple:#b06aff;
-  --yellow:#ffd166;
-  --red:#ff5c5c;
+  --blue:#4a9eff;--green:#3dd68c;--orange:#ff8c42;--purple:#b06aff;
+  --yellow:#ffd166;--red:#ff5c5c;
+  --blue-bg:rgba(74,158,255,.12);--blue-fg:#4a9eff;
+  --green-bg:rgba(61,214,140,.12);--green-fg:#3dd68c;
+  --orange-bg:rgba(255,140,66,.12);--orange-fg:#ff8c42;
+  --purple-bg:rgba(176,106,255,.12);--purple-fg:#c48aff;
+  --gray-bg:rgba(114,114,122,.12);--gray-fg:#b8b8c0;
   --mono:'IBM Plex Mono',monospace;
   --sans:'IBM Plex Sans',sans-serif;
 }
 html,body{height:100%;overflow:hidden}
 body{font-family:var(--sans);background:var(--bg0);color:var(--text0);font-size:13px;line-height:1.5}
 
-/* ---- auth ----------------------------------------------------------------- */
-#authScreen{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;background:var(--bg0);z-index:1000}
+/* Auth */
+#auth{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;background:var(--bg0);z-index:1000}
 .auth-wrap{width:360px}
 .auth-logo{text-align:center;margin-bottom:28px}
-.auth-logo-mark{display:inline-flex;align-items:center;gap:10px;margin-bottom:12px}
-.auth-logo-icon{width:36px;height:36px;background:var(--accent);border-radius:8px;display:flex;align-items:center;justify-content:center}
-.auth-logo-icon svg{width:18px;height:18px;color:#000}
-.auth-title{font-size:20px;font-weight:600;letter-spacing:-.3px}
+.auth-icon{display:inline-flex;align-items:center;justify-content:center;width:40px;height:40px;background:var(--accent);border-radius:9px;margin-bottom:12px}
+.auth-icon svg{width:18px;height:18px;color:#000}
+.auth-h1{font-size:21px;font-weight:600;letter-spacing:-.3px}
 .auth-sub{color:var(--text2);font-size:12px;margin-top:4px;font-family:var(--mono)}
-.auth-card{background:var(--bg2);border:1px solid var(--border);border-radius:12px;padding:28px}
-.auth-card h2{font-size:15px;font-weight:600;margin-bottom:20px}
-.auth-alert{padding:9px 12px;border-radius:7px;font-size:12px;margin-bottom:14px;display:none}
-.auth-alert.error{background:rgba(255,92,92,.12);border:1px solid rgba(255,92,92,.3);color:#ff8a8a}
-.auth-alert.info{background:rgba(74,158,255,.1);border:1px solid rgba(74,158,255,.25);color:#7ab8ff}
-.field{margin-bottom:14px}
-.field label{display:block;font-size:11px;font-weight:500;color:var(--text2);margin-bottom:6px;text-transform:uppercase;letter-spacing:.6px;font-family:var(--mono)}
+.auth-card{background:var(--bg2);border:1px solid var(--border);border-radius:12px;padding:26px}
+.auth-card h2{font-size:15px;font-weight:600;margin-bottom:18px}
+.auth-err,.auth-info{padding:8px 12px;border-radius:7px;font-size:12px;margin-bottom:12px;display:none}
+.auth-err{background:rgba(255,92,92,.1);border:1px solid rgba(255,92,92,.25);color:#ff8a8a}
+.auth-info{background:rgba(74,158,255,.1);border:1px solid rgba(74,158,255,.25);color:#7ab8ff}
+.field{margin-bottom:13px}
+.field label{display:block;font-size:11px;font-weight:500;color:var(--text2);margin-bottom:5px;text-transform:uppercase;letter-spacing:.6px;font-family:var(--mono)}
 .field input{width:100%;background:var(--bg3);border:1px solid var(--border2);border-radius:7px;padding:9px 12px;font-size:13px;color:var(--text0);font-family:var(--sans);outline:none;transition:border-color .15s}
 .field input:focus{border-color:var(--accent)}
-.btn-auth{width:100%;background:var(--accent);color:#0e0e0f;border:none;border-radius:7px;padding:10px;font-size:13px;font-weight:600;cursor:pointer;transition:opacity .15s;margin-top:4px;font-family:var(--sans)}
-.btn-auth:hover{opacity:.9}
-.btn-auth:disabled{opacity:.5;cursor:not-allowed}
-.auth-links{border-top:1px solid var(--border);margin-top:20px;padding-top:16px;display:flex;flex-direction:column;gap:8px;align-items:center}
+.btn-primary{width:100%;background:var(--accent);color:#0e0e0f;border:none;border-radius:7px;padding:10px;font-size:13px;font-weight:600;cursor:pointer;margin-top:4px;font-family:var(--sans);display:flex;align-items:center;justify-content:center;gap:7px}
+.btn-primary:disabled{opacity:.5;cursor:not-allowed}
+.auth-links{border-top:1px solid var(--border);margin-top:18px;padding-top:16px;display:flex;flex-direction:column;gap:8px;align-items:center}
 .auth-links button{background:none;border:none;cursor:pointer;font-size:12px;color:var(--text2);font-family:var(--sans)}
 .auth-links button span{color:var(--accent)}
-.auth-foot{text-align:center;margin-top:14px;font-size:11px;color:var(--text3);font-family:var(--mono)}
+.auth-foot{text-align:center;margin-top:12px;font-size:11px;color:var(--text3);font-family:var(--mono)}
 
-/* ---- app shell ------------------------------------------------------------ */
-#appScreen{display:none;height:100vh;flex-direction:column}
-#appScreen.visible{display:flex}
+/* App shell */
+#app{display:none;height:100vh;flex-direction:column}
+#app.on{display:flex}
 
-/* topbar */
+/* Topbar */
 .topbar{height:48px;background:var(--bg1);border-bottom:1px solid var(--border);display:flex;align-items:center;padding:0 16px;gap:12px;flex-shrink:0}
-.topbar-brand{display:flex;align-items:center;gap:8px;font-weight:600;font-size:13px;margin-right:4px}
+.topbar-brand{font-weight:600;font-size:13px;display:flex;align-items:center;gap:8px}
 .topbar-icon{width:26px;height:26px;background:var(--accent);border-radius:6px;display:flex;align-items:center;justify-content:center;flex-shrink:0}
 .topbar-icon svg{width:13px;height:13px;color:#000}
-.topbar-divider{width:1px;height:20px;background:var(--border);flex-shrink:0}
 .topbar-right{margin-left:auto;display:flex;align-items:center;gap:8px;position:relative}
+.ai-badge{background:var(--green-bg);border:1px solid rgba(61,214,140,.3);color:var(--green);font-family:var(--mono);font-size:10px;font-weight:500;padding:3px 9px;border-radius:20px}
 .avatar-btn{display:flex;align-items:center;gap:7px;background:var(--bg3);border:1px solid var(--border);border-radius:7px;padding:5px 10px;cursor:pointer;font-size:12px;color:var(--text1)}
 .avatar{width:22px;height:22px;border-radius:50%;background:var(--accent);display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:700;color:#000;flex-shrink:0}
 .dropdown{position:absolute;right:0;top:calc(100% + 6px);background:var(--bg3);border:1px solid var(--border2);border-radius:9px;padding:10px;min-width:200px;z-index:100;display:none}
 .dropdown.open{display:block}
-.dropdown-email{font-size:11px;color:var(--text2);padding-bottom:8px;margin-bottom:8px;border-bottom:1px solid var(--border);font-family:var(--mono)}
-.dropdown-email strong{display:block;color:var(--text1);font-weight:500;margin-bottom:2px}
+.dropdown-info{font-size:11px;color:var(--text2);padding-bottom:8px;margin-bottom:8px;border-bottom:1px solid var(--border);font-family:var(--mono)}
+.dropdown-info strong{display:block;color:var(--text1);font-weight:500;margin-bottom:2px}
 .dropdown button{width:100%;text-align:left;background:none;border:none;cursor:pointer;font-size:12px;color:#ff8a8a;padding:3px 0;font-family:var(--sans)}
 
-/* filter bar */
+/* Filter bar */
 .filterbar{height:44px;background:var(--bg1);border-bottom:1px solid var(--border);display:flex;align-items:center;gap:6px;padding:0 16px;flex-shrink:0;overflow-x:auto}
 .filterbar::-webkit-scrollbar{display:none}
-.filter-chip{padding:5px 12px;border-radius:20px;font-size:11px;font-weight:500;cursor:pointer;border:1px solid var(--border2);color:var(--text2);background:transparent;white-space:nowrap;transition:all .15s;font-family:var(--sans)}
-.filter-chip:hover{border-color:var(--border2);color:var(--text1);background:var(--bg3)}
-.filter-chip.active{background:var(--bg4);color:var(--text0);border-color:var(--border2)}
+.chip{padding:5px 12px;border-radius:20px;font-size:11px;font-weight:500;cursor:pointer;border:1px solid var(--border2);color:var(--text2);background:transparent;white-space:nowrap;font-family:var(--sans)}
+.chip.on{background:var(--bg4);color:var(--text0);border-color:var(--border2)}
 
-/* main layout */
+/* Layout */
 .layout{display:flex;flex:1;overflow:hidden}
 
-/* sidebar */
-.sidebar{width:280px;flex-shrink:0;background:var(--bg1);border-right:1px solid var(--border);display:flex;flex-direction:column;overflow:hidden}
-.sidebar-header{padding:12px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;flex-shrink:0}
-.sidebar-header-label{font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.8px;color:var(--text2);font-family:var(--mono)}
+/* Sidebar */
+.sidebar{width:272px;flex-shrink:0;background:var(--bg1);border-right:1px solid var(--border);display:flex;flex-direction:column;overflow:hidden}
+.sidebar-hdr{padding:11px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;flex-shrink:0}
+.sidebar-hdr-label{font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.8px;color:var(--text2);font-family:var(--mono)}
 .sidebar-count{font-size:11px;color:var(--accent);font-family:var(--mono);font-weight:600}
-.sidebar-search{padding:10px 12px;border-bottom:1px solid var(--border);flex-shrink:0}
-.sidebar-search input{width:100%;background:var(--bg3);border:1px solid var(--border);border-radius:7px;padding:7px 10px 7px 30px;font-size:12px;color:var(--text0);outline:none;font-family:var(--sans)}
-.sidebar-search input:focus{border-color:var(--border2)}
-.search-wrap{position:relative}
-.search-icon{position:absolute;left:9px;top:50%;transform:translateY(-50%);color:var(--text3);pointer-events:none}
+.sidebar-search{padding:9px 12px;border-bottom:1px solid var(--border);flex-shrink:0}
+.sidebar-search-wrap{position:relative}
+.sidebar-search-icon{position:absolute;left:9px;top:50%;transform:translateY(-50%);color:var(--text3);pointer-events:none}
+.sidebar-search input{width:100%;background:var(--bg3);border:1px solid var(--border);border-radius:7px;padding:7px 10px 7px 28px;font-size:12px;color:var(--text0);outline:none;font-family:var(--sans)}
 .sidebar-list{flex:1;overflow-y:auto}
 .sidebar-list::-webkit-scrollbar{width:3px}
-.sidebar-list::-webkit-scrollbar-track{background:transparent}
 .sidebar-list::-webkit-scrollbar-thumb{background:var(--border2);border-radius:3px}
-.agency-item{display:flex;align-items:center;gap:10px;padding:11px 16px;cursor:pointer;border-left:2px solid transparent;transition:all .1s}
-.agency-item:hover{background:var(--bg2)}
-.agency-item.active{background:var(--bg2);border-left-color:var(--accent)}
-.agency-logo{width:32px;height:32px;border-radius:8px;background:var(--bg4);display:flex;align-items:center;justify-content:center;font-size:13px;flex-shrink:0;font-weight:700;color:var(--text1)}
+.agency-row{display:flex;align-items:center;gap:9px;padding:10px 16px;cursor:pointer;border-left:2px solid transparent}
+.agency-row:hover{background:var(--bg2)}
+.agency-row.on{background:var(--bg2);border-left-color:var(--accent)}
+.agency-logo{width:30px;height:30px;border-radius:7px;background:var(--bg4);display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;flex-shrink:0}
 .agency-info{flex:1;min-width:0}
 .agency-name{font-size:13px;font-weight:500;color:var(--text1);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.agency-item.active .agency-name{color:var(--text0)}
+.agency-row.on .agency-name{color:var(--text0)}
 .agency-type{font-size:11px;color:var(--text3);margin-top:1px}
 .agency-num{font-size:12px;color:var(--text2);font-family:var(--mono);flex-shrink:0}
-.agency-item.active .agency-num{color:var(--accent)}
-.sidebar-empty{padding:32px 16px;text-align:center;color:var(--text3);font-size:12px}
+.agency-row.on .agency-num{color:var(--accent)}
+.sidebar-empty{padding:28px 16px;text-align:center;color:var(--text3);font-size:12px;line-height:1.6}
 
-/* detail panel */
+/* Detail panel */
 .detail{flex:1;overflow-y:auto;background:var(--bg0);display:flex;flex-direction:column}
 .detail::-webkit-scrollbar{width:4px}
-.detail::-webkit-scrollbar-track{background:transparent}
 .detail::-webkit-scrollbar-thumb{background:var(--border);border-radius:4px}
-.detail-empty{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;color:var(--text3)}
-.detail-empty-icon{font-size:36px;opacity:.3}
+.detail-empty{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;color:var(--text3)}
+.detail-empty-icon{font-size:34px;opacity:.3}
 .detail-empty p{font-size:13px;font-family:var(--mono)}
-
-/* detail header */
-.detail-header{padding:24px 28px 20px;border-bottom:1px solid var(--border);flex-shrink:0}
-.detail-title-row{display:flex;align-items:center;gap:14px;margin-bottom:14px}
-.detail-logo{width:44px;height:44px;border-radius:10px;background:var(--bg3);border:1px solid var(--border2);display:flex;align-items:center;justify-content:center;font-size:18px;font-weight:700;color:var(--text1);flex-shrink:0}
-.detail-name{font-size:22px;font-weight:600;letter-spacing:-.4px}
+.detail-hdr{padding:22px 26px 18px;border-bottom:1px solid var(--border);flex-shrink:0}
+.detail-title-row{display:flex;align-items:center;gap:13px;margin-bottom:13px}
+.detail-logo-box{width:42px;height:42px;border-radius:10px;background:var(--bg3);border:1px solid var(--border2);display:flex;align-items:center;justify-content:center;font-size:17px;font-weight:700;flex-shrink:0}
+.detail-name{font-size:20px;font-weight:600;letter-spacing:-.3px}
 .detail-domain{font-size:12px;color:var(--text2);font-family:var(--mono);margin-top:2px}
-.detail-badges{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px}
-.source-badge{padding:4px 10px;border-radius:5px;font-size:11px;font-weight:600;font-family:var(--mono);cursor:default}
-.sb-case{background:rgba(61,214,140,.12);color:#3dd68c;border:1px solid rgba(61,214,140,.25)}
-.sb-testimonial{background:rgba(74,158,255,.12);color:#4a9eff;border:1px solid rgba(74,158,255,.25)}
-.sb-logo{background:rgba(255,140,66,.12);color:#ff8c42;border:1px solid rgba(255,140,66,.25)}
-.sb-table{background:rgba(176,106,255,.12);color:#c48aff;border:1px solid rgba(176,106,255,.25)}
-.sb-heading{background:rgba(200,241,53,.1);color:var(--accent);border:1px solid rgba(200,241,53,.2)}
-.sb-list{background:rgba(114,114,122,.12);color:var(--text1);border:1px solid var(--border)}
-.detail-stats{display:flex;gap:28px}
-.stat-item{display:flex;flex-direction:column;gap:2px}
-.stat-num{font-size:26px;font-weight:600;color:var(--accent);font-family:var(--mono);line-height:1}
+.detail-badges{display:flex;gap:7px;flex-wrap:wrap;margin-bottom:14px}
+.src-badge{padding:3px 9px;border-radius:5px;font-size:11px;font-weight:600;font-family:var(--mono)}
+.stats-row{display:flex;gap:26px}
+.stat{display:flex;flex-direction:column;gap:2px}
+.stat-num{font-size:24px;font-weight:600;color:var(--accent);font-family:var(--mono);line-height:1}
 .stat-label{font-size:11px;color:var(--text2);text-transform:uppercase;letter-spacing:.5px}
 
-/* client table */
-.table-wrap{padding:0 28px 28px;flex:1}
-.table-toolbar{display:flex;align-items:center;gap:10px;padding:16px 0 12px;border-bottom:1px solid var(--border);margin-bottom:0}
-.table-search{flex:1;background:var(--bg2);border:1px solid var(--border);border-radius:7px;padding:7px 10px 7px 30px;font-size:12px;color:var(--text0);outline:none;font-family:var(--sans);max-width:260px}
-.table-search:focus{border-color:var(--border2)}
+/* Table */
+.table-area{padding:0 26px 26px;flex:1}
+.table-toolbar{display:flex;align-items:center;gap:9px;padding:14px 0 11px;border-bottom:1px solid var(--border);margin-bottom:0}
 .table-search-wrap{position:relative;display:flex;align-items:center}
 .table-search-wrap svg{position:absolute;left:9px;color:var(--text3);pointer-events:none}
+.table-search{background:var(--bg2);border:1px solid var(--border);border-radius:7px;padding:7px 10px 7px 28px;font-size:12px;color:var(--text0);outline:none;font-family:var(--sans);width:220px}
 .table-count{font-size:11px;color:var(--text2);font-family:var(--mono);margin-left:auto}
+.remove-btn{background:none;border:1px solid var(--border);border-radius:6px;padding:5px 10px;color:var(--text3);font-size:11px;cursor:pointer;font-family:var(--mono)}
+.remove-btn:hover{color:var(--red);border-color:rgba(255,92,92,.4)}
 table{width:100%;border-collapse:collapse}
 thead tr{border-bottom:1px solid var(--border)}
-thead th{padding:10px 12px;font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.7px;color:var(--text3);text-align:left;font-family:var(--mono);white-space:nowrap}
-tbody tr{border-bottom:1px solid var(--border);transition:background .1s;cursor:default}
+thead th{padding:9px 10px;font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.7px;color:var(--text3);text-align:left;font-family:var(--mono);white-space:nowrap}
+tbody tr{border-bottom:1px solid var(--border);transition:background .1s}
 tbody tr:hover{background:var(--bg2)}
 tbody tr:last-child{border-bottom:none}
-td{padding:13px 12px;font-size:13px;vertical-align:middle}
-.td-company{font-weight:600;color:var(--text0)}
-.td-industry{color:var(--text1)}
-.td-source-tag{display:inline-flex;padding:3px 8px;border-radius:4px;font-size:11px;font-weight:600;font-family:var(--mono)}
-.td-country{color:var(--text2);font-family:var(--mono);font-size:11px}
-.td-date{color:var(--text2);font-family:var(--mono);font-size:11px}
-.td-link a{color:var(--text3);font-size:11px;font-family:var(--mono);text-decoration:none;background:var(--bg3);border:1px solid var(--border);padding:3px 8px;border-radius:5px;transition:all .15s;display:inline-flex;align-items:center;gap:4px}
-.td-link a:hover{color:var(--text1);border-color:var(--border2)}
-.empty-table{text-align:center;padding:48px 0;color:var(--text3);font-family:var(--mono);font-size:12px}
+td{padding:11px 10px;vertical-align:top;font-size:13px}
+.td-num{color:var(--text3);font-family:var(--mono);font-size:11px;white-space:nowrap;width:28px}
+.td-name{font-weight:600;color:var(--text0);min-width:120px}
+.td-ind{color:var(--text1);min-width:100px}
+.td-ctr{color:var(--text2);font-size:12px;white-space:nowrap}
+.td-src{}
+.td-note{color:var(--text2);font-size:12px;line-height:1.4;min-width:160px}
+.src-tag{display:inline-block;padding:2px 7px;border-radius:4px;font-size:10px;font-weight:600;font-family:var(--mono);white-space:nowrap}
+.s-case{background:var(--blue-bg);color:var(--blue-fg)}
+.s-ref{background:var(--green-bg);color:var(--green-fg)}
+.s-logo{background:var(--orange-bg);color:var(--orange-fg)}
+.s-testi{background:var(--purple-bg);color:var(--purple-fg)}
+.s-blog{background:var(--green-bg);color:var(--green-fg)}
+.s-job{background:var(--purple-bg);color:var(--purple-fg)}
+.s-partner{background:rgba(255,255,255,.06);color:var(--text2)}
+.s-other{background:var(--gray-bg);color:var(--gray-fg)}
+.section-divider td{padding:7px 10px;font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.7px;color:var(--text2);background:var(--bg2);border-top:1px solid var(--border);font-family:var(--mono)}
+.empty-table{text-align:center;padding:40px;color:var(--text3);font-family:var(--mono);font-size:12px}
 
-/* scrape bar */
-.scrape-panel{border-top:1px solid var(--border);background:var(--bg1);padding:12px 28px;flex-shrink:0}
-.scrape-row{display:flex;gap:8px;align-items:center}
-.scrape-input{flex:1;background:var(--bg3);border:1px solid var(--border2);border-radius:7px;padding:9px 14px;font-size:13px;color:var(--text0);font-family:var(--mono);outline:none;transition:border-color .15s}
+/* Scrape bar */
+.scrape-bar{border-top:1px solid var(--border);background:var(--bg1);padding:12px 26px;flex-shrink:0}
+.scrape-row{display:flex;gap:8px}
+.scrape-input{flex:1;background:var(--bg3);border:1px solid var(--border2);border-radius:7px;padding:9px 13px;font-size:13px;color:var(--text0);font-family:var(--mono);outline:none}
 .scrape-input:focus{border-color:var(--accent)}
 .scrape-input::placeholder{color:var(--text3)}
-.btn-scrape{background:var(--accent);color:#000;border:none;border-radius:7px;padding:9px 18px;font-size:13px;font-weight:600;cursor:pointer;white-space:nowrap;font-family:var(--sans);transition:opacity .15s;display:flex;align-items:center;gap:7px}
-.btn-scrape:disabled{opacity:.5;cursor:not-allowed}
-.btn-scrape:hover:not(:disabled){opacity:.88}
-.scrape-hint{font-size:11px;color:var(--text3);font-family:var(--mono);margin-top:6px}
-.scrape-progress{display:none;align-items:center;gap:8px;font-size:11px;color:var(--text2);font-family:var(--mono);margin-top:8px}
-.scrape-progress.visible{display:flex}
-.scrape-error{font-size:11px;color:#ff8a8a;font-family:var(--mono);margin-top:6px;display:none}
-.scrape-error.visible{display:block}
+.scrape-btn{background:var(--accent);color:#000;border:none;border-radius:7px;padding:9px 18px;font-size:13px;font-weight:600;cursor:pointer;font-family:var(--sans);display:flex;align-items:center;gap:7px;white-space:nowrap}
+.scrape-btn:disabled{opacity:.5;cursor:not-allowed}
+.scrape-status{display:none;align-items:center;gap:8px;font-size:11px;color:var(--text2);font-family:var(--mono);margin-top:7px}
+.scrape-status.on{display:flex}
+.scrape-hint{font-size:11px;color:var(--text3);font-family:var(--mono);margin-top:5px}
+.scrape-err{font-size:11px;color:#ff8a8a;font-family:var(--mono);margin-top:5px;display:none}
+.scrape-err.on{display:block}
+.log-toggle{background:none;border:1px solid var(--border);border-radius:5px;padding:2px 7px;cursor:pointer;color:var(--text3);font-size:10px;font-family:var(--mono);margin-left:auto}
+.log-box{background:var(--bg0);border:1px solid var(--border);border-radius:7px;padding:8px 12px;max-height:120px;overflow-y:auto;font-family:var(--mono);font-size:10px;color:var(--text2);line-height:1.7;margin-top:6px;display:none}
+.log-box.on{display:block}
 
-/* spinner */
-.spin{display:inline-block;width:12px;height:12px;border-radius:50%;border:2px solid rgba(0,0,0,.2);border-top-color:#000;animation:spin .7s linear infinite;flex-shrink:0}
-.spin-light{border-color:rgba(255,255,255,.15);border-top-color:var(--text1)}
+/* Settings modal */
+.modal-bg{position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:500;align-items:center;justify-content:center;display:none}
+.modal-bg.on{display:flex}
+.modal{background:var(--bg2);border:1px solid var(--border2);border-radius:14px;width:440px;max-width:95vw;padding:26px}
+.modal-title{display:flex;align-items:center;justify-content:space-between;margin-bottom:18px}
+.modal-title h2{font-size:15px;font-weight:600}
+.modal-close{background:none;border:none;cursor:pointer;color:var(--text2);font-size:20px;line-height:1}
+.modal-section{margin-bottom:18px;padding:13px;background:var(--bg3);border-radius:9px;border:1px solid var(--border)}
+.modal-section-title{font-size:12px;font-weight:600;color:var(--text1);margin-bottom:6px;display:flex;align-items:center;gap:8px}
+.modal-section-desc{font-size:12px;color:var(--text2);line-height:1.6}
+.key-row{display:flex;gap:8px;margin-top:12px}
+.key-row input{flex:1;background:var(--bg3);border:1px solid var(--border2);border-radius:7px;padding:8px 12px;font-size:12px;color:var(--text0);font-family:var(--mono);outline:none}
+.key-row input:focus{border-color:var(--accent)}
+.key-save-btn{background:var(--accent);color:#000;border:none;border-radius:7px;padding:8px 14px;font-size:12px;font-weight:600;cursor:pointer;font-family:var(--sans);white-space:nowrap}
+.key-msg{font-size:11px;margin-top:6px;font-family:var(--mono)}
+.modal-hint{font-size:11px;color:var(--text3);line-height:1.7;font-family:var(--mono)}
+
+/* Spinner */
+.spin{display:inline-block;width:12px;height:12px;border-radius:50%;border:2px solid rgba(255,255,255,.15);border-top-color:var(--text1);animation:spin .7s linear infinite;flex-shrink:0}
+.spin-dark{border-color:rgba(0,0,0,.2);border-top-color:#000}
 @keyframes spin{to{transform:rotate(360deg)}}
 
-/* log */
-.log-box{background:var(--bg0);border:1px solid var(--border);border-radius:7px;padding:8px 12px;max-height:100px;overflow-y:auto;font-family:var(--mono);font-size:10px;color:var(--text2);line-height:1.7;margin-top:8px;display:none}
-.log-box.visible{display:block}
-
-/* alerts */
-.alert{padding:8px 12px;border-radius:7px;font-size:12px;margin-top:8px;display:none;font-family:var(--mono)}
-.alert.visible{display:block}
-.alert.error{background:rgba(255,92,92,.1);border:1px solid rgba(255,92,92,.2);color:#ff8a8a}
+@media(max-width:600px){
+  .sidebar{width:220px}
+  .detail-hdr,.table-area{padding-left:16px;padding-right:16px}
+}
 </style>
 </head>
 <body>
 
 <!-- AUTH -->
-<div id="authScreen">
+<div id="auth">
   <div class="auth-wrap">
     <div class="auth-logo">
-      <div class="auth-logo-mark">
-        <div class="auth-logo-icon">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
-        </div>
-        <span class="auth-title">Client Intel</span>
-      </div>
+      <div class="auth-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg></div>
+      <div class="auth-h1">Client Intelligence</div>
       <div class="auth-sub">// competitor client discovery</div>
     </div>
     <div class="auth-card">
       <h2 id="authTitle">Sign in</h2>
-      <div class="auth-alert error" id="authErr"></div>
-      <div class="auth-alert info" id="authInfo"></div>
-      <div class="field">
-        <label>Email</label>
-        <input type="email" id="authEmail" placeholder="you@company.com" autocomplete="email">
-      </div>
-      <div class="field" id="pwField">
-        <label>Password</label>
-        <input type="password" id="authPw" placeholder="Min. 8 characters" autocomplete="current-password">
-      </div>
-      <div class="field" id="pw2Field" style="display:none">
-        <label>Confirm password</label>
-        <input type="password" id="authPw2" placeholder="Repeat password">
-      </div>
-      <button class="btn-auth" id="authBtn" onclick="handleAuth()">Sign in</button>
+      <div class="auth-err" id="authErr"></div>
+      <div class="auth-info" id="authInfo"></div>
+      <div class="field"><label>Email</label><input type="email" id="authEmail" placeholder="you@company.com" autocomplete="email"></div>
+      <div class="field" id="pwField"><label>Password</label><input type="password" id="authPw" placeholder="Min 8 characters"></div>
+      <div class="field" id="pw2Field" style="display:none"><label>Confirm password</label><input type="password" id="authPw2" placeholder="Repeat password"></div>
+      <button class="btn-primary" id="authBtn" onclick="doAuth()">Sign in</button>
       <div class="auth-links" id="authLinks1">
         <button onclick="setMode('signup')">No account? <span>Create one</span></button>
         <button onclick="setMode('reset')">Forgot password?</button>
@@ -1098,64 +884,54 @@ td{padding:13px 12px;font-size:13px;vertical-align:middle}
         <button onclick="setMode('login')">Back to sign in</button>
       </div>
     </div>
-    <div class="auth-foot">passwords hashed with SHA-256 // data stored on server</div>
+    <div class="auth-foot">passwords hashed with SHA-256</div>
   </div>
 </div>
 
 <!-- APP -->
-<div id="appScreen">
-
+<div id="app">
   <!-- topbar -->
   <nav class="topbar">
     <div class="topbar-brand">
-      <div class="topbar-icon">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
-      </div>
+      <div class="topbar-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg></div>
       Client Intel
     </div>
-    <div class="topbar-divider"></div>
-    <span style="font-size:11px;color:var(--text3);font-family:var(--mono)">competitor client discovery</span>
+    <div style="font-size:11px;color:var(--text3);font-family:var(--mono)">// competitor intelligence</div>
     <div class="topbar-right">
-      <button onclick="toggleSettings()" id="settingsBtn" style="background:var(--bg3);border:1px solid var(--border);border-radius:7px;padding:5px 10px;cursor:pointer;font-size:11px;color:var(--text2);font-family:var(--mono);display:flex;align-items:center;gap:6px">
-        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
-        <span id="aiStatusDot">AI</span>
-      </button>
+      <span class="ai-badge">AI ON</span>
+      <button onclick="showSettings()" style="background:var(--bg3);border:1px solid var(--border);border-radius:7px;padding:5px 10px;cursor:pointer;font-size:11px;color:var(--text2);font-family:var(--mono)">Settings</button>
       <button class="avatar-btn" onclick="toggleDrop()">
         <span class="avatar" id="avLetter">?</span>
-        <span id="avEmail" style="max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:var(--mono)"></span>
+        <span id="avEmail" style="max-width:130px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:var(--mono)"></span>
       </button>
       <div class="dropdown" id="dropdown">
-        <div class="dropdown-email">
-          <strong id="dropEmail"></strong>
-          <span id="dropStats"></span>
-        </div>
+        <div class="dropdown-info"><strong id="dropEmail"></strong><span id="dropStats"></span></div>
         <button onclick="doLogout()">Sign out</button>
       </div>
     </div>
   </nav>
 
-  <!-- filter bar -->
+  <!-- filter chips -->
   <div class="filterbar" id="filterbar">
-    <button class="filter-chip active" data-type="all" onclick="setFilter('all',this)">All agencies</button>
+    <button class="chip on" data-f="all" onclick="setFilter('all',this)">All</button>
   </div>
 
   <!-- main -->
   <div class="layout">
-
     <!-- sidebar -->
     <aside class="sidebar">
-      <div class="sidebar-header">
-        <span class="sidebar-header-label">Agencies</span>
+      <div class="sidebar-hdr">
+        <span class="sidebar-hdr-label">Companies</span>
         <span class="sidebar-count" id="sideCount">0</span>
       </div>
       <div class="sidebar-search">
-        <div class="search-wrap">
-          <svg class="search-icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
-          <input type="text" id="sideSearch" placeholder="Search agencies..." oninput="renderSidebar()">
+        <div class="sidebar-search-wrap">
+          <svg class="sidebar-search-icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
+          <input type="text" id="sideQ" placeholder="Search..." oninput="renderSidebar()">
         </div>
       </div>
       <div class="sidebar-list" id="sideList">
-        <div class="sidebar-empty">No agencies yet.<br>Scrape one below.</div>
+        <div class="sidebar-empty">No companies yet.<br>Paste a URL below to start.</div>
       </div>
     </aside>
 
@@ -1163,381 +939,368 @@ td{padding:13px 12px;font-size:13px;vertical-align:middle}
     <main class="detail" id="detail">
       <div class="detail-empty" id="detailEmpty">
         <div class="detail-empty-icon">&#128269;</div>
-        <p>Select an agency to view clients</p>
+        <p>Select a company or scrape a new one</p>
       </div>
-      <div id="detailContent" style="display:none;flex-direction:column;flex:1">
-
-        <!-- header -->
-        <div class="detail-header">
+      <div id="detailContent" style="display:none">
+        <div class="detail-hdr">
           <div class="detail-title-row">
-            <div class="detail-logo" id="dLogo"></div>
+            <div class="detail-logo-box" id="dLogo"></div>
             <div>
               <div class="detail-name" id="dName"></div>
-              <div class="detail-domain"><a id="dDomain" href="#" target="_blank" style="color:var(--text2);text-decoration:none"></a></div>
+              <div class="detail-domain"><a id="dDomain" href="#" target="_blank" style="color:var(--text2);text-decoration:none;font-family:var(--mono);font-size:12px"></a></div>
             </div>
           </div>
           <div class="detail-badges" id="dBadges"></div>
-          <div class="detail-stats">
-            <div class="stat-item">
-              <span class="stat-num" id="dCount">0</span>
-              <span class="stat-label">Indexed clients</span>
-            </div>
-            <div class="stat-item">
-              <span class="stat-num" id="dIndustries">0</span>
-              <span class="stat-label">Industries</span>
-            </div>
-            <div class="stat-item" id="dCountryStat" style="display:none">
-              <span class="stat-num" id="dCountries">0</span>
-              <span class="stat-label">Countries</span>
-            </div>
+          <div class="stats-row">
+            <div class="stat"><span class="stat-num" id="dCount">0</span><span class="stat-label">Clients</span></div>
+            <div class="stat"><span class="stat-num" id="dIndustries">0</span><span class="stat-label">Industries</span></div>
+            <div class="stat" id="dCountryStat"><span class="stat-num" id="dCountries">0</span><span class="stat-label">Countries</span></div>
           </div>
         </div>
-
-        <!-- table -->
-        <div class="table-wrap">
+        <div class="table-area">
           <div class="table-toolbar">
             <div class="table-search-wrap">
               <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
-              <input class="table-search" type="text" id="tableSearch" placeholder="Filter clients..." oninput="renderTable()">
+              <input class="table-search" type="text" id="tableQ" placeholder="Filter clients..." oninput="renderTable()">
             </div>
             <span class="table-count" id="tableCount"></span>
-            <button onclick="deleteCompany()" style="background:none;border:1px solid var(--border);border-radius:6px;padding:5px 10px;color:var(--text3);font-size:11px;cursor:pointer;font-family:var(--mono)">Remove</button>
+            <button class="remove-btn" onclick="deleteCompany()">Remove</button>
           </div>
           <table>
-            <thead>
-              <tr>
-                <th style="width:36px">#</th>
-                <th>Company</th>
-                <th>Industry</th>
-                <th>Country</th>
-                <th>Source</th>
-                <th>Indexed</th>
-                <th></th>
-              </tr>
-            </thead>
+            <thead><tr>
+              <th class="td-num">#</th>
+              <th style="min-width:130px">Company</th>
+              <th style="min-width:110px">Industry</th>
+              <th style="min-width:80px">Country</th>
+              <th style="min-width:90px">Source</th>
+              <th>Evidence / project</th>
+            </tr></thead>
             <tbody id="clientTbody"></tbody>
           </table>
         </div>
-
       </div>
     </main>
-
   </div>
 
   <!-- scrape bar -->
-  <div class="scrape-panel">
+  <div class="scrape-bar">
     <div class="scrape-row">
       <input class="scrape-input" type="text" id="scrapeInput"
-        placeholder="https://www.flowout.com/portfolio  or  imagine.si  or  any company URL"
-        onkeydown="if(event.key==='Enter')doScrape()">
-      <button class="btn-scrape" id="scrapeBtn" onclick="doScrape()">
+        placeholder="https://www.optiweb.com  or  metronik.si  or  any company URL"
+        onkeydown="if(event.key==='Enter'&&!S.loading)doScrape()">
+      <button class="scrape-btn" id="scrapeBtn" onclick="doScrape()">
         <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
         Scrape
       </button>
     </div>
-    <div class="scrape-progress" id="scrapeProgress">
-      <span class="spin spin-light"></span>
-      <span id="progressMsg">Scraping...</span>
-      <button onclick="toggleLog()" style="background:none;border:none;cursor:pointer;color:var(--text3);font-size:10px;margin-left:auto">logs</button>
+    <div class="scrape-status" id="scrapeStatus">
+      <span class="spin"></span>
+      <span id="statusMsg">Working...</span>
+      <button class="log-toggle" onclick="toggleLog()">logs</button>
     </div>
-    <div class="alert error" id="scrapeErr"></div>
+    <div class="scrape-err" id="scrapeErr"></div>
     <div class="log-box" id="logBox"></div>
-    <div class="scrape-hint">Direct URL works best &mdash; e.g. company.com/clients/ &bull; Zero AI tokens</div>
+    <div class="scrape-hint">AI searches web + fetches pages + extracts verified clients &mdash; 3-phase pipeline</div>
   </div>
-
 </div>
 
 <!-- Settings modal -->
-<div id="settingsModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:500;align-items:center;justify-content:center">
-  <div style="background:var(--bg2);border:1px solid var(--border2);border-radius:14px;width:460px;padding:28px;max-width:95vw">
-    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:20px">
-      <h2 style="font-size:16px;font-weight:600">Settings</h2>
-      <button onclick="toggleSettings()" style="background:none;border:none;cursor:pointer;color:var(--text2);font-size:20px;line-height:1">&times;</button>
+<div class="modal-bg" id="settingsModal">
+  <div class="modal">
+    <div class="modal-title">
+      <h2>Settings</h2>
+      <button class="modal-close" onclick="hideSettings()">&times;</button>
     </div>
-
-    <div style="margin-bottom:20px;padding:14px;background:var(--bg3);border-radius:9px;border:1px solid var(--border)">
-      <div style="font-size:12px;font-weight:600;color:var(--text1);margin-bottom:6px;display:flex;align-items:center;gap:8px">
-        <span id="aiStatusIcon">&#9679;</span> AI Cleaning
-        <span id="aiStatusLabel" style="font-size:11px;font-weight:400;font-family:var(--mono)"></span>
-      </div>
-      <div style="font-size:12px;color:var(--text2);line-height:1.6">
-        When enabled, Claude validates each scraped entry — removes noise (headlines, nav items, decorative logos),
-        extracts real company names from case study titles, and enriches with industry data.
+    <div class="modal-section">
+      <div class="modal-section-title"><span style="color:var(--green)">&#9679;</span> AI Pipeline &mdash; Active</div>
+      <div class="modal-section-desc">
+        3-phase intelligence: web search discovers all client pages &rarr; full HTML fetched &rarr;
+        Claude extracts verified clients with industry, country, source type and evidence note.
+        Technology partners are automatically separated from real clients.
       </div>
     </div>
-
-    <div style="margin-bottom:6px">
-      <label style="display:block;font-size:11px;font-weight:500;color:var(--text2);margin-bottom:6px;text-transform:uppercase;letter-spacing:.6px;font-family:var(--mono)">Anthropic API Key</label>
-      <div style="display:flex;gap:8px">
-        <input type="password" id="apiKeyInput" placeholder="sk-ant-api03-..." style="flex:1;background:var(--bg3);border:1px solid var(--border2);border-radius:7px;padding:9px 12px;font-size:13px;color:var(--text0);font-family:var(--mono);outline:none">
-        <button onclick="saveApiKey()" style="background:var(--accent);color:#000;border:none;border-radius:7px;padding:9px 16px;font-size:13px;font-weight:600;cursor:pointer;white-space:nowrap;font-family:var(--sans)">Save</button>
+    <div class="modal-section">
+      <div class="modal-section-title">Custom Anthropic API key (optional)</div>
+      <div class="modal-section-desc">Add your own key to use your quota instead of the built-in key.</div>
+      <div class="key-row">
+        <input type="password" id="keyInput" placeholder="sk-ant-...  (leave blank to use built-in)">
+        <button class="key-save-btn" onclick="saveKey()">Save</button>
       </div>
-      <div id="apiKeyMsg" style="font-size:11px;margin-top:6px;font-family:var(--mono)"></div>
+      <div class="key-msg" id="keyMsg"></div>
     </div>
-
-    <div style="font-size:11px;color:var(--text3);margin-top:12px;font-family:var(--mono);line-height:1.7">
-      Get a free key at console.anthropic.com &rarr; API Keys<br>
-      Stored securely in the database, used only for cleaning scraped data.<br>
-      Leave blank to disable AI cleaning (raw scrape results only).
+    <div class="modal-hint">
+      Built-in key is always active &mdash; no setup needed.<br>
+      Get your own key at console.anthropic.com &rarr; API Keys.
     </div>
   </div>
 </div>
 
 <script>
-// ---- state ------------------------------------------------------------------
-let S = { user: null, repo: {}, selected: null, filter: 'all', showLog: false };
+// ── State ────────────────────────────────────────────────────────────────────
+const S = { user:null, repo:{}, selected:null, filter:"all", loading:false, showLog:false };
 
-const SOURCE_CLASS = {
-  'table':           'sb-table',
-  'heading':         'sb-heading',
-  'case study link': 'sb-case',
-  'list':            'sb-list',
-  'card':            'sb-list',
-  'grid':            'sb-list',
-  'logo alt':        'sb-logo',
-  'logo title':      'sb-logo',
-  'logo filename':   'sb-logo',
-  'json-ld':         'sb-list',
+const SRC_LABEL = {
+  case_study:"Case Study", reference_list:"Reference", reference:"Reference",
+  logo:"Logo", testimonial:"Testimonial", blog:"Blog", job_listing:"Job Listing",
+  technology_partner:"Tech Partner",
 };
-
+const SRC_CLASS = {
+  case_study:"s-case", reference_list:"s-ref", reference:"s-ref",
+  logo:"s-logo", testimonial:"s-testi", blog:"s-blog", job_listing:"s-job",
+  technology_partner:"s-partner",
+};
 const TYPE_COLORS = {
-  'Performance Marketing': '#ff8c42',
-  'System Integrator':     '#4a9eff',
-  'AI Agency':             '#b06aff',
-  'Webflow Agency':        '#3dd68c',
-  'Design Agency':         '#ffd166',
-  'Content Agency':        '#ff5c8a',
-  'Dev Agency':            '#c8f135',
+  "Performance Marketing":"#ff8c42","System Integrator":"#4a9eff",
+  "AI Agency":"#b06aff","Webflow Agency":"#3dd68c","Design Agency":"#ffd166",
+  "Dev Agency":"#c8f135","Digital Agency":"#4a9eff",
 };
 
-// ---- api --------------------------------------------------------------------
+// ── API ──────────────────────────────────────────────────────────────────────
 async function api(method, path, body) {
-  const opts = { method, credentials: 'include', headers: { 'Content-Type': 'application/json' } };
+  const opts = { method, credentials:"include", headers:{"Content-Type":"application/json"} };
   if (body) opts.body = JSON.stringify(body);
   const r = await fetch(path, opts);
-  const ct = r.headers.get('content-type') || '';
-  if (!ct.includes('application/json')) {
+  const ct = r.headers.get("content-type") || "";
+  if (!ct.includes("application/json")) {
     const t = await r.text();
-    throw new Error('Server error (' + r.status + '): ' + t.slice(0, 120));
+    throw new Error("Server error (" + r.status + "): " + t.slice(0,120));
   }
   const data = await r.json();
-  if (!r.ok) throw new Error(data.error || 'Request failed');
+  if (!r.ok) throw new Error(data.error || "Request failed");
   return data;
 }
 
-// ---- boot -------------------------------------------------------------------
+// ── Boot ─────────────────────────────────────────────────────────────────────
 async function init() {
   try {
-    const me = await api('GET', '/api/me');
-    await loginSuccess(me.email, true);
+    const me = await api("GET","/api/me");
+    S.repo = await api("GET","/api/repo");
+    loginDone(me.email);
   } catch { showAuth(); }
 }
 
 function showAuth() {
-  document.getElementById('authScreen').style.display = 'flex';
-  document.getElementById('appScreen').classList.remove('visible');
+  document.getElementById("auth").style.display = "flex";
+  document.getElementById("app").classList.remove("on");
 }
 
-async function loginSuccess(email, load) {
+function loginDone(email) {
   S.user = email;
-  document.getElementById('authScreen').style.display = 'none';
-  document.getElementById('appScreen').classList.add('visible');
-  document.getElementById('avLetter').textContent = email[0].toUpperCase();
-  document.getElementById('avEmail').textContent = email;
-  document.getElementById('dropEmail').textContent = email;
-  if (load) {
-    try { S.repo = await api('GET', '/api/repo'); } catch { S.repo = {}; }
-  }
+  document.getElementById("auth").style.display = "none";
+  document.getElementById("app").classList.add("on");
+  document.getElementById("avLetter").textContent = email[0].toUpperCase();
+  document.getElementById("avEmail").textContent = email;
+  document.getElementById("dropEmail").textContent = email;
   renderAll();
 }
 
-// ---- auth -------------------------------------------------------------------
-let authMode = 'login';
+// ── Auth ──────────────────────────────────────────────────────────────────────
+let authMode = "login";
 function setMode(m) {
   authMode = m;
-  document.getElementById('authErr').style.display = 'none';
-  document.getElementById('authInfo').style.display = 'none';
-  const titles = { login:'Sign in', signup:'Create account', reset:'Reset password' };
-  const btns   = { login:'Sign in', signup:'Create account', reset:'Send reset link' };
-  document.getElementById('authTitle').textContent  = titles[m];
-  document.getElementById('authBtn').textContent    = btns[m];
-  document.getElementById('pwField').style.display  = m === 'reset'  ? 'none' : '';
-  document.getElementById('pw2Field').style.display = m === 'signup' ? ''     : 'none';
-  document.getElementById('authLinks1').style.display = m === 'login' ? '' : 'none';
-  document.getElementById('authLinks2').style.display = m !== 'login' ? '' : 'none';
+  document.getElementById("authErr").style.display="none";
+  document.getElementById("authInfo").style.display="none";
+  const T={login:"Sign in",signup:"Create account",reset:"Reset password"};
+  const B={login:"Sign in",signup:"Create account",reset:"Send reset link"};
+  document.getElementById("authTitle").textContent = T[m];
+  document.getElementById("authBtn").textContent   = B[m];
+  document.getElementById("pwField").style.display  = m==="reset"?"none":"";
+  document.getElementById("pw2Field").style.display = m==="signup"?"":"none";
+  document.getElementById("authLinks1").style.display = m==="login"?"":"none";
+  document.getElementById("authLinks2").style.display = m!=="login"?"":"none";
 }
-document.getElementById('authEmail').addEventListener('keydown', e => { if (e.key === 'Enter') handleAuth(); });
-document.getElementById('authPw').addEventListener('keydown',   e => { if (e.key === 'Enter') handleAuth(); });
 
-async function handleAuth() {
-  const email = document.getElementById('authEmail').value.trim().toLowerCase();
-  const pw    = document.getElementById('authPw').value;
-  const pw2   = document.getElementById('authPw2').value;
-  const err   = document.getElementById('authErr');
-  const info  = document.getElementById('authInfo');
-  err.style.display = info.style.display = 'none';
-  const btn = document.getElementById('authBtn');
+["authEmail","authPw","authPw2"].forEach(id =>
+  document.getElementById(id).addEventListener("keydown", e => { if(e.key==="Enter") doAuth(); })
+);
+
+async function doAuth() {
+  const email = document.getElementById("authEmail").value.trim().toLowerCase();
+  const pw    = document.getElementById("authPw").value;
+  const pw2   = document.getElementById("authPw2").value;
+  const errEl = document.getElementById("authErr");
+  const infEl = document.getElementById("authInfo");
+  errEl.style.display = infEl.style.display = "none";
+  const btn = document.getElementById("authBtn");
   btn.disabled = true;
-  btn.innerHTML = '<span class="spin"></span> Please wait...';
+  btn.innerHTML = "<span class='spin spin-dark'></span> Please wait...";
   try {
-    if (authMode === 'login') {
-      const r = await api('POST', '/api/login', { email, password: pw });
-      S.repo = await api('GET', '/api/repo');
-      await loginSuccess(r.email, false);
-    } else if (authMode === 'signup') {
-      if (pw.length < 8) throw new Error('Password must be at least 8 characters');
-      if (pw !== pw2) throw new Error('Passwords do not match');
-      const r = await api('POST', '/api/signup', { email, password: pw });
+    if (authMode === "login") {
+      await api("POST","/api/login",{email,password:pw});
+      S.repo = await api("GET","/api/repo");
+      loginDone(email);
+    } else if (authMode === "signup") {
+      if (pw.length < 8) throw new Error("Password must be at least 8 characters");
+      if (pw !== pw2) throw new Error("Passwords do not match");
+      await api("POST","/api/signup",{email,password:pw});
       S.repo = {};
-      await loginSuccess(r.email, false);
+      loginDone(email);
     } else {
-      info.textContent = 'If an account exists, a reset link would be sent.';
-      info.style.display = 'block';
+      infEl.textContent = "If an account exists, a reset link would be sent. (Requires backend SMTP.)";
+      infEl.style.display = "block";
     }
   } catch(e) {
-    err.textContent = e.message;
-    err.style.display = 'block';
+    errEl.textContent = e.message;
+    errEl.style.display = "block";
   } finally {
     btn.disabled = false;
-    btn.textContent = { login:'Sign in', signup:'Create account', reset:'Send reset link' }[authMode];
+    btn.textContent = {login:"Sign in",signup:"Create account",reset:"Send reset link"}[authMode];
   }
 }
 
 async function doLogout() {
-  await api('POST', '/api/logout').catch(() => {});
-  S.user = null; S.repo = {}; S.selected = null;
-  document.getElementById('dropdown').classList.remove('open');
+  await api("POST","/api/logout").catch(()=>{});
+  S.user=null; S.repo={}; S.selected=null;
+  document.getElementById("dropdown").classList.remove("open");
   showAuth();
 }
 
-function toggleDrop() { document.getElementById('dropdown').classList.toggle('open'); }
-document.addEventListener('click', e => { if (!e.target.closest('.topbar-right')) document.getElementById('dropdown').classList.remove('open'); });
+function toggleDrop() { document.getElementById("dropdown").classList.toggle("open"); }
+document.addEventListener("click", e => {
+  if (!e.target.closest(".topbar-right")) document.getElementById("dropdown").classList.remove("open");
+});
 
-// ---- scrape -----------------------------------------------------------------
+// ── Scrape ────────────────────────────────────────────────────────────────────
 async function doScrape() {
-  const url = document.getElementById('scrapeInput').value.trim();
-  if (!url) return;
-  const btn = document.getElementById('scrapeBtn');
-  const prog = document.getElementById('scrapeProgress');
-  const errEl = document.getElementById('scrapeErr');
-  const logBox = document.getElementById('logBox');
-
+  const url = document.getElementById("scrapeInput").value.trim();
+  if (!url || S.loading) return;
+  S.loading = true;
+  const btn   = document.getElementById("scrapeBtn");
+  const stat  = document.getElementById("scrapeStatus");
+  const errEl = document.getElementById("scrapeErr");
+  const logBox= document.getElementById("logBox");
   btn.disabled = true;
-  btn.innerHTML = '<span class="spin"></span> Scraping...';
-  prog.classList.add('visible');
-  errEl.classList.remove('visible');
-  logBox.innerHTML = '';
-  document.getElementById('progressMsg').textContent = 'Fetching page...';
-
+  btn.innerHTML = "<span class='spin spin-dark'></span> Scraping...";
+  stat.classList.add("on");
+  errEl.classList.remove("on");
+  logBox.innerHTML = "";
+  document.getElementById("statusMsg").textContent = "Phase 1: Searching for client pages...";
   try {
-    const r = await api('POST', '/api/scrape', { url });
-    (r.logs || []).forEach(l => {
-      const d = document.createElement('div');
-      d.textContent = l;
-      logBox.appendChild(d);
-      logBox.scrollTop = logBox.scrollHeight;
-      document.getElementById('progressMsg').textContent = l.slice(0, 80);
+    const r = await api("POST","/api/scrape",{url});
+    (r.logs||[]).forEach(l => {
+      document.getElementById("statusMsg").textContent = l.slice(0,80);
+      const d = document.createElement("div"); d.textContent = l;
+      logBox.appendChild(d); logBox.scrollTop = logBox.scrollHeight;
     });
-    S.repo = await api('GET', '/api/repo');
+    S.repo = await api("GET","/api/repo");
     renderAll();
     if (r.result?.key) selectCompany(r.result.key);
-    document.getElementById('scrapeInput').value = '';
+    document.getElementById("scrapeInput").value = "";
+    if (r.result?.error) {
+      errEl.textContent = r.result.error;
+      errEl.classList.add("on");
+    }
   } catch(e) {
     errEl.textContent = e.message;
-    errEl.classList.add('visible');
+    errEl.classList.add("on");
   } finally {
+    S.loading = false;
     btn.disabled = false;
-    btn.innerHTML = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg> Scrape';
-    prog.classList.remove('visible');
+    btn.innerHTML = "<svg width='13' height='13' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2.5'><circle cx='11' cy='11' r='8'/><path d='m21 21-4.35-4.35'/></svg> Scrape";
+    stat.classList.remove("on");
   }
 }
 
 function toggleLog() {
   S.showLog = !S.showLog;
-  document.getElementById('logBox').classList.toggle('visible', S.showLog);
+  document.getElementById("logBox").classList.toggle("on", S.showLog);
 }
 
-// ---- delete -----------------------------------------------------------------
 async function deleteCompany() {
-  if (!S.selected) return;
-  if (!confirm('Remove this company from your repository?')) return;
-  await api('DELETE', '/api/repo/' + S.selected);
+  if (!S.selected || !confirm("Remove this company?")) return;
+  await api("DELETE","/api/repo/"+S.selected);
   delete S.repo[S.selected];
   S.selected = null;
+  document.getElementById("detailContent").style.display = "none";
+  document.getElementById("detailEmpty").style.display   = "flex";
   renderAll();
-  document.getElementById('detailContent').style.display = 'none';
-  document.getElementById('detailEmpty').style.display = 'flex';
 }
 
-// ---- filters ----------------------------------------------------------------
-function setFilter(type, el) {
-  S.filter = type;
-  document.querySelectorAll('.filter-chip').forEach(c => c.classList.remove('active'));
-  el.classList.add('active');
-  renderSidebar();
+// ── Settings ──────────────────────────────────────────────────────────────────
+function showSettings() { document.getElementById("settingsModal").classList.add("on"); }
+function hideSettings() { document.getElementById("settingsModal").classList.remove("on"); }
+document.getElementById("settingsModal").addEventListener("click", function(e){ if(e.target===this) hideSettings(); });
+
+async function saveKey() {
+  const key = document.getElementById("keyInput").value.trim();
+  const msg = document.getElementById("keyMsg");
+  try {
+    await api("POST","/api/settings/apikey",{key});
+    msg.style.color = "var(--green)";
+    msg.textContent = key ? "Key saved. Your quota will be used." : "Key cleared. Built-in key active.";
+  } catch(e) {
+    msg.style.color = "var(--red)";
+    msg.textContent = e.message;
+  }
 }
 
-function buildFilters() {
-  const types = new Set(['all']);
-  Object.values(S.repo).forEach(c => { if (c.agency_type) types.add(c.agency_type); });
-  const bar = document.getElementById('filterbar');
-  bar.innerHTML = '';
-  types.forEach(t => {
-    const btn = document.createElement('button');
-    btn.className = 'filter-chip' + (S.filter === t ? ' active' : '');
-    btn.dataset.type = t;
-    btn.textContent = t === 'all' ? 'All agencies' : t;
-    btn.onclick = () => setFilter(t, btn);
-    bar.appendChild(btn);
-  });
-}
-
-// ---- render -----------------------------------------------------------------
+// ── Render ────────────────────────────────────────────────────────────────────
 function renderAll() {
-  buildFilters();
+  buildFilterBar();
   renderSidebar();
   updateDropStats();
   if (S.selected && S.repo[S.selected]) renderDetail(S.selected);
 }
 
-function getTypeColor(type) {
-  return TYPE_COLORS[type] || 'var(--text2)';
+function getTypeColor(c) {
+  if (c.detected_language === "slovenian") return "#c8f135";
+  if (c.detected_language === "german")    return "#4a9eff";
+  if (c.detected_language === "croatian")  return "#3dd68c";
+  return "#b8b8c0";
 }
 
-function companyInitial(name) {
-  return (name || '?')[0].toUpperCase();
+function buildFilterBar() {
+  const types = new Set(["all"]);
+  Object.values(S.repo).forEach(c => { if(c.agency_type) types.add(c.agency_type); });
+  const bar = document.getElementById("filterbar");
+  bar.innerHTML = "";
+  types.forEach(t => {
+    const b = document.createElement("button");
+    b.className = "chip" + (S.filter===t?" on":"");
+    b.dataset.f = t;
+    b.textContent = t==="all" ? "All" : t;
+    b.onclick = () => setFilter(t,b);
+    bar.appendChild(b);
+  });
+}
+
+function setFilter(f, el) {
+  S.filter = f;
+  document.querySelectorAll(".chip").forEach(c=>c.classList.remove("on"));
+  el.classList.add("on");
+  renderSidebar();
 }
 
 function renderSidebar() {
   const companies = Object.values(S.repo);
-  const q = (document.getElementById('sideSearch').value || '').toLowerCase();
+  const q = (document.getElementById("sideQ").value||"").toLowerCase();
   const filtered = companies.filter(c => {
-    if (S.filter !== 'all' && c.agency_type !== S.filter) return false;
+    if (S.filter!=="all" && c.agency_type!==S.filter) return false;
     if (q && !c.company_name.toLowerCase().includes(q) &&
-        !(c.clients||[]).some(cl => cl.name.toLowerCase().includes(q))) return false;
+        !(c.clients||[]).some(cl=>cl.name.toLowerCase().includes(q))) return false;
     return true;
-  }).sort((a,b) => (b.clients||[]).length - (a.clients||[]).length);
+  }).sort((a,b)=>(b.clients||[]).filter(c=>c.source!=="technology_partner").length -
+                 (a.clients||[]).filter(c=>c.source!=="technology_partner").length);
 
-  document.getElementById('sideCount').textContent = filtered.length;
-
-  const list = document.getElementById('sideList');
-  if (filtered.length === 0) {
-    list.innerHTML = '<div class="sidebar-empty">No agencies yet.<br>Scrape one below.</div>';
+  document.getElementById("sideCount").textContent = filtered.length;
+  const list = document.getElementById("sideList");
+  if (!filtered.length) {
+    list.innerHTML = "<div class='sidebar-empty'>No companies yet.<br>Paste a URL below to start.</div>";
     return;
   }
-
+  const color = c => getTypeColor(c);
   list.innerHTML = filtered.map(c => {
-    const color = getTypeColor(c.agency_type);
-    const n = (c.clients||[]).length;
-    return `<div class="agency-item${S.selected === c.key ? ' active' : ''}" onclick="selectCompany('${esc(c.key)}')">
-      <div class="agency-logo" style="color:${color};background:${color}18;border:1px solid ${color}30">${companyInitial(c.company_name)}</div>
+    const n = (c.clients||[]).filter(cl=>cl.source!=="technology_partner").length;
+    const col = color(c);
+    return `<div class="agency-row${S.selected===c.key?" on":""}" onclick="selectCompany('${esc(c.key)}')">
+      <div class="agency-logo" style="color:${col};background:${col}18;border:1px solid ${col}25">${(c.company_name||"?")[0].toUpperCase()}</div>
       <div class="agency-info">
         <div class="agency-name">${esc(c.company_name)}</div>
-        <div class="agency-type" style="color:${color}">${esc(c.agency_type || c.detected_language || 'Agency')}</div>
+        <div class="agency-type">${esc(c.detected_country||c.detected_language||"")}</div>
       </div>
       <div class="agency-num">${n}</div>
     </div>`;
-  }).join('');
+  }).join("");
 }
 
 function selectCompany(key) {
@@ -1549,155 +1312,121 @@ function selectCompany(key) {
 function renderDetail(key) {
   const c = S.repo[key];
   if (!c) return;
+  document.getElementById("detailEmpty").style.display    = "none";
+  document.getElementById("detailContent").style.display = "block";
 
-  document.getElementById('detailEmpty').style.display = 'none';
-  const dc = document.getElementById('detailContent');
-  dc.style.display = 'flex';
+  const col = getTypeColor(c);
+  const logoEl = document.getElementById("dLogo");
+  logoEl.textContent = (c.company_name||"?")[0].toUpperCase();
+  logoEl.style.cssText = `width:42px;height:42px;border-radius:10px;background:${col}18;border:1px solid ${col}30;display:flex;align-items:center;justify-content:center;font-size:17px;font-weight:700;flex-shrink:0;color:${col}`;
 
-  const color = getTypeColor(c.agency_type);
-  document.getElementById('dLogo').textContent = companyInitial(c.company_name);
-  document.getElementById('dLogo').style.cssText = `color:${color};background:${color}18;border:1px solid ${color}30;width:44px;height:44px;border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:18px;font-weight:700;flex-shrink:0`;
-  document.getElementById('dName').textContent = c.company_name;
-  const domEl = document.getElementById('dDomain');
+  document.getElementById("dName").textContent = c.company_name;
+  const domEl = document.getElementById("dDomain");
   domEl.textContent = c.company_domain;
-  domEl.href = 'https://' + c.company_domain;
+  domEl.href = "https://"+c.company_domain;
 
   // Source breakdown badges
   const srcMap = {};
   (c.clients||[]).forEach(cl => {
-    const s = cl.source || 'unknown';
-    const key2 = s.includes('case') ? 'Case Study' : s.includes('table') ? 'Table' :
-                 s.includes('logo') ? 'Logo' : s.includes('heading') ? 'Heading' :
-                 s.includes('list') || s.includes('card') || s.includes('grid') ? 'List/Section' : 'Other';
-    srcMap[key2] = (srcMap[key2]||0) + 1;
+    const s = cl.source||"reference";
+    const label = cl.source==="technology_partner" ? "Tech Partner" :
+                  cl.source==="case_study"  ? "Case Study" :
+                  cl.source==="reference_list"||cl.source==="reference" ? "Reference" :
+                  cl.source==="logo" ? "Logo" :
+                  cl.source==="testimonial" ? "Testimonial" :
+                  cl.source==="blog" ? "Blog" :
+                  cl.source==="job_listing" ? "Job Listing" : s;
+    const cls   = cl.source==="technology_partner" ? "s-partner" :
+                  cl.source==="case_study" ? "s-case" :
+                  cl.source==="reference_list"||cl.source==="reference" ? "s-ref" :
+                  cl.source==="logo" ? "s-logo" : "s-other";
+    if (!srcMap[label]) srcMap[label] = {count:0, cls};
+    srcMap[label].count++;
   });
-  const badgeClass = { 'Case Study':'sb-case','Table':'sb-table','Logo':'sb-logo','Heading':'sb-heading','List/Section':'sb-list','Other':'sb-list' };
-  document.getElementById('dBadges').innerHTML =
-    Object.entries(srcMap).sort((a,b)=>b[1]-a[1])
-      .map(([k,v]) => `<span class="source-badge ${badgeClass[k]||'sb-list'}">${v} ${k}${v>1&&k!=='Other'?'s':''}</span>`).join('');
+  document.getElementById("dBadges").innerHTML =
+    Object.entries(srcMap).sort((a,b)=>b[1].count-a[1].count)
+      .map(([l,v])=>`<span class="src-badge ${v.cls}">${v.count} ${l}${v.count>1?"s":""}</span>`).join("");
 
-  // Stats
-  const clients = c.clients || [];
-  document.getElementById('dCount').textContent = clients.length;
-  const industries = new Set(clients.map(cl => cl.industry).filter(Boolean));
-  document.getElementById('dIndustries').textContent = industries.size;
-  const countries = new Set(clients.map(cl => cl.country).filter(Boolean));
-  if (countries.size > 0) {
-    document.getElementById('dCountryStat').style.display = '';
-    document.getElementById('dCountries').textContent = countries.size;
-  } else {
-    document.getElementById('dCountryStat').style.display = 'none';
-  }
+  const clients = c.clients||[];
+  const realClients = clients.filter(cl=>cl.source!=="technology_partner");
+  document.getElementById("dCount").textContent = realClients.length;
+  const industries = new Set(realClients.map(cl=>cl.industry).filter(Boolean));
+  document.getElementById("dIndustries").textContent = industries.size;
+  const countries  = new Set(realClients.map(cl=>cl.country).filter(Boolean));
+  const cstat = document.getElementById("dCountryStat");
+  cstat.style.display = countries.size>0?"":"none";
+  document.getElementById("dCountries").textContent = countries.size;
 
-  document.getElementById('tableSearch').value = '';
+  document.getElementById("tableQ").value = "";
   renderTable();
+}
+
+function srcTag(src) {
+  const label = SRC_LABEL[src] || src || "Reference";
+  const cls   = SRC_CLASS[src]  || "s-other";
+  return `<span class="src-tag ${cls}">${esc(label)}</span>`;
 }
 
 function renderTable() {
   const c = S.repo[S.selected];
   if (!c) return;
-  const q = (document.getElementById('tableSearch').value || '').toLowerCase();
-  const clients = (c.clients||[]).filter(cl =>
+  const q = (document.getElementById("tableQ").value||"").toLowerCase();
+  const all = (c.clients||[]).filter(cl =>
     !q || cl.name.toLowerCase().includes(q) ||
-    (cl.industry||'').toLowerCase().includes(q) ||
-    (cl.country||'').toLowerCase().includes(q)
+    (cl.industry||"").toLowerCase().includes(q) ||
+    (cl.country||"").toLowerCase().includes(q) ||
+    (cl.ai_note||"").toLowerCase().includes(q)
   );
+  const real     = all.filter(cl => cl.source !== "technology_partner");
+  const partners = all.filter(cl => cl.source === "technology_partner");
+  const total    = (c.clients||[]).filter(cl=>cl.source!=="technology_partner").length;
+  document.getElementById("tableCount").textContent =
+    q ? `${real.length} of ${total} clients` : `${total} clients`;
 
-  document.getElementById('tableCount').textContent = clients.length + ' clients';
-
-  const tbody = document.getElementById('clientTbody');
-  if (clients.length === 0) {
-    tbody.innerHTML = `<tr><td colspan="7" class="empty-table">No clients found${q ? ' matching "'+q+'"' : ''}.</td></tr>`;
+  const tbody = document.getElementById("clientTbody");
+  if (!all.length) {
+    tbody.innerHTML = `<tr><td colspan="6" class="empty-table">No clients found${q?` matching "${q}"`:""}.</td></tr>`;
     return;
   }
 
-  const scraped = c.scraped_at ? new Date(c.scraped_at) : null;
-  tbody.innerHTML = clients.map((cl, i) => {
-    const src = cl.source || '';
-    const srcKey = src.includes('case') ? 'Case Study' : src.includes('table') ? 'Table' :
-                   src.includes('logo') ? 'Logo' : src.includes('heading') ? 'Heading' :
-                   src.includes('list')||src.includes('card')||src.includes('grid') ? 'Section' : src;
-    const cls = SOURCE_CLASS[src] || 'sb-list';
-    const dateStr = scraped ? scraped.toLocaleDateString('en-US', {month:'short',year:'numeric'}) : '';
-    const sourceUrl = (c.sources_checked||[])[0];
-    return `<tr>
-      <td style="color:var(--text3);font-family:var(--mono);font-size:11px">${i+1}</td>
-      <td class="td-company">${esc(cl.name)}</td>
-      <td class="td-industry">${esc(cl.industry||'')}</td>
-      <td class="td-country">${esc(cl.country||'')}</td>
-      <td><span class="td-source-tag ${cls}">${esc(srcKey)}</span></td>
-      <td class="td-date">${dateStr}</td>
-      <td class="td-link">${sourceUrl ? `<a href="${esc(sourceUrl)}" target="_blank">Source &nearr;</a>` : ''}</td>
+  const makeRow = (cl, i) => `
+    <tr>
+      <td class="td-num">${i+1}</td>
+      <td class="td-name">${esc(cl.name)}</td>
+      <td class="td-ind">${esc(cl.industry||"")}</td>
+      <td class="td-ctr">${esc(cl.country||"")}</td>
+      <td class="td-src">${srcTag(cl.source)}</td>
+      <td class="td-note">${esc((cl.ai_note||"").slice(0,100))}${(cl.ai_note||"").length>100?"...":""}</td>
     </tr>`;
-  }).join('');
+
+  let html = real.map((cl,i) => makeRow(cl,i+1)).join("");
+  if (partners.length) {
+    html += `<tr class="section-divider"><td colspan="6">Technology partners</td></tr>`;
+    html += partners.map((cl,i) => makeRow(cl,i+1)).join("");
+  }
+  tbody.innerHTML = html;
 }
 
 function updateDropStats() {
   const n = Object.keys(S.repo).length;
-  const c = new Set(Object.values(S.repo).flatMap(r => (r.clients||[]).map(x=>x.name.toLowerCase()))).size;
-  document.getElementById('dropStats').textContent = n + ' companies, ' + c + ' clients';
+  const t = new Set(Object.values(S.repo)
+    .flatMap(r=>(r.clients||[])
+      .filter(c=>c.source!=="technology_partner")
+      .map(c=>c.name.toLowerCase()))).size;
+  document.getElementById("dropStats").textContent = `${n} companies, ${t} clients`;
 }
 
 function esc(s) {
-  return (s||'').toString().replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
-}
-
-// ---- settings ---------------------------------------------------------------
-function toggleSettings() {
-  const m = document.getElementById('settingsModal');
-  m.style.display = m.style.display === 'flex' ? 'none' : 'flex';
-  if (m.style.display === 'flex') loadSettings();
-}
-document.getElementById('settingsModal').addEventListener('click', function(e) {
-  if (e.target === this) toggleSettings();
-});
-
-async function loadSettings() {
-  try {
-    const s = await api('GET', '/api/settings');
-    const dot = document.getElementById('aiStatusDot');
-    const label = document.getElementById('aiStatusLabel');
-    const topDot = document.getElementById('aiStatusDot');
-    if (s.ai_enabled) {
-      dot.style.color = 'var(--green)';
-      label.textContent = s.has_env_key ? 'enabled (server key)' : 'enabled (your key)';
-      topDot.textContent = 'AI ON';
-      document.getElementById('settingsBtn').style.borderColor = 'rgba(61,214,140,.4)';
-      document.getElementById('settingsBtn').style.color = 'var(--green)';
-    } else {
-      dot.style.color = 'var(--text3)';
-      label.textContent = 'disabled - add API key to enable';
-      topDot.textContent = 'AI';
-      document.getElementById('settingsBtn').style.borderColor = '';
-      document.getElementById('settingsBtn').style.color = '';
-    }
-    if (s.has_user_key) {
-      document.getElementById('apiKeyInput').placeholder = 'sk-ant-... (saved)';
-    }
-  } catch(e) {}
-}
-
-async function saveApiKey() {
-  const key = document.getElementById('apiKeyInput').value.trim();
-  const msg = document.getElementById('apiKeyMsg');
-  try {
-    const r = await api('POST', '/api/settings/apikey', { key });
-    msg.style.color = 'var(--green)';
-    msg.textContent = r.ai_enabled ? 'AI cleaning enabled.' : 'Key cleared. AI cleaning disabled.';
-    loadSettings();
-  } catch(e) {
-    msg.style.color = 'var(--red)';
-    msg.textContent = e.message;
-  }
+  return (s||"").toString()
+    .replace(/&/g,"&amp;").replace(/</g,"&lt;")
+    .replace(/>/g,"&gt;").replace(/"/g,"&quot;");
 }
 
 init();
 </script>
 </body>
 </html>
-
 """
-
 
 @app.route("/")
 @app.route("/<path:path>")
@@ -1705,8 +1434,6 @@ def frontend(path=""):
     if path and path.startswith("api/"):
         return jsonify(error="Not found"), 404
     return INDEX_HTML, 200, {"Content-Type": "text/html; charset=utf-8"}
-
-# ---- run ----------------------------------------------------------------------
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
