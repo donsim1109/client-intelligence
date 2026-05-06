@@ -1,0 +1,12 @@
+.claude/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.Python
+.env
+.env.*
+!.env.example
+.idea/
+.vscode/
+*.log
